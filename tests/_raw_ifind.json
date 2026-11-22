@@ -1,0 +1,12 @@
+{
+  "id": 2,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\"code\":1,\"msg\":\"success\",\"subCode\":null,\"subMsg\":null,\"data\":{\"tables\":[[\"\u8bc1\u5238\u4ee3\u7801\",\"\u8bc1\u5238\u7b80\u79f0\",\"time\",\"\u6700\u65b0\u4ef7\",\"\u6da8\u8dcc\u5e45\",\"\u603b\u5e02\u503c\",\"\u5e02\u76c8\u7387TTM\",\"\u6210\u4ea4\u989d\"],[\"300750.SZ\",\"\u5b81\u5fb7\u65f6\u4ee3\",\"2026-11-17 10:45:04\",\"240.2\",\"-0.12474012474012948\",\"1.1114653745772E12\",\"12.67389288\",\"3.17225105046E9\"]],\"symbolMap\":{\"300750.SZ\":\"\u5b81\u5fb7\u65f6\u4ee3\"},\"indicatorMap\":{\"\u603b\u5e02\u503c\":\"totalCapital\",\"\u6210\u4ea4\u989d\":\"amount\",\"\u6700\u65b0\u4ef7\":\"latest\",\"\u6da8\u8dcc\u5e45\":\"changeRatio\",\"\u5e02\u76c8\u7387TTM\":\"pe_ttm\"},\"dataVol\":\"5\"}}"
+      }
+    ]
+  },
+  "jsonrpc": "2.0"
+}

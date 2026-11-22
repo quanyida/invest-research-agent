@@ -1,0 +1,14 @@
+begin;
+alter function auth_register(uuid, uuid, text, text, text) owner to invest_auth;
+alter function auth_login_lookup(text) owner to invest_auth;
+alter function auth_session_create(uuid, text, uuid, uuid, timestamptz) owner to invest_auth;
+alter function auth_session_resolve(text) owner to invest_auth;
+alter function auth_session_revoke(text) owner to invest_auth;
+alter function auth_session_touch(text) owner to invest_auth;
+grant execute on function auth_register(uuid, uuid, text, text, text) to invest_app;
+grant execute on function auth_login_lookup(text) to invest_app;
+grant execute on function auth_session_create(uuid, text, uuid, uuid, timestamptz) to invest_app;
+grant execute on function auth_session_resolve(text) to invest_app;
+grant execute on function auth_session_revoke(text) to invest_app;
+grant execute on function auth_session_touch(text) to invest_app;
+commit;

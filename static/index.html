@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>研究工作台 · 投研 Agent</title>
+  <link rel="stylesheet" href="/assets/app.css?v=1.13">
+</head>
+<body data-page="chat">
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-mark">IA</span>
+        <div>
+          <div class="brand-title">投研 Agent</div>
+          <div class="brand-sub">iFinD research desk</div>
+        </div>
+      </div>
+      <button class="btn btn-primary btn-block" id="newConversation" type="button">＋ 新建会话</button>
+      <div class="section-label">最近会话</div>
+      <nav class="conversation-list" id="conversationList" aria-label="会话列表"></nav>
+      <div class="sidebar-foot">
+        <div class="sidebar-links">
+          <a class="sidebar-link" href="/ui/usage">用量与限额</a>
+          <button class="sidebar-link" id="logoutButton" type="button" style="border:0;background:transparent;text-align:left">退出登录</button>
+        </div>
+        <div class="user-row">
+          <span class="user-dot" aria-hidden="true"></span>
+          <div class="user-copy">
+            <div class="user-email" id="userEmail"></div>
+            <div class="user-tenant" id="userTenant"></div>
+          </div>
+        </div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="main-head">
+        <div>
+          <h1 class="main-title" id="pageTitle">研究工作台</h1>
+          <p class="main-sub" id="pageSub">用自然语言提问，得到带证据编号的答案。</p>
+        </div>
+        <div class="head-note" id="headNote">EVIDENCE LEDGER · V1</div>
+      </header>
+
+      <div class="workspace">
+        <section class="conversation-panel" id="conversationPanel">
+          <div class="error-banner" id="errorBanner" role="alert"></div>
+          <div class="empty-state" id="emptyState">
+            <div class="empty-kicker">ASK A RESEARCH QUESTION</div>
+            <h2 class="empty-title">从一只股票、一个指标开始。</h2>
+            <p class="empty-copy">回答会按“结论、依据、关键数据、待确认”组织。每轮会先自动执行一次网页检索，再结合 iFinD 与公开网页结果回答；结构化数字优先使用 iFinD。右侧按轮次分组列出证据，点击正文引用可展开对应轮次。</p>
+            <div class="example-list" id="exampleList">
+              <button class="example-chip" type="button" data-question="宁德时代 2025Q3 毛利率多少，同比变化？">宁德时代 2025Q3 毛利率</button>
+              <button class="example-chip" type="button" data-question="比亚迪和宁德时代 2025Q3 净利率对比">两家公司净利率对比</button>
+              <button class="example-chip" type="button" data-question="宁德时代最近有什么新闻">宁德时代近期新闻</button>
+              <button class="example-chip" type="button" data-question="上月 CPI 多少">上月 CPI</button>
+            </div>
+          </div>
+          <div id="messages" aria-live="polite"></div>
+        </section>
+
+        <aside class="evidence-panel" aria-label="证据">
+          <h2 class="panel-title">证据 <span class="panel-count" id="evidenceCount">0 条</span></h2>
+
+          <div id="evidenceList">
+            <div class="evidence-empty">提问后，这里会按轮次分组列出证据，点击正文引用可展开对应轮次。</div>
+          </div>
+        </aside>
+      </div>
+
+      <div class="composer-wrap">
+        <form class="composer" id="questionForm">
+          <textarea id="questionInput" rows="1" maxlength="2000" placeholder="问一个可验证的问题，例如：宁德时代 2025Q3 毛利率多少，同比变化？" aria-label="问题"></textarea>
+          <button class="btn btn-primary" id="sendButton" type="submit">发送</button>
+        </form>
+        <div class="composer-foot">
+          <div class="composer-status" id="agentStatus">准备就绪</div>
+          <div class="composer-hint">Enter 发送 · Shift+Enter 换行</div>
+        </div>
+      </div>
+    </main>
+  </div>
+  <script src="/assets/app.js?v=1.14" defer></script>
+</body>
+</html>

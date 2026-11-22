@@ -1,0 +1,32 @@
+.env
+.venv/
+.python/
+.uv-cache/
+data/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.log
+skills/ifind-finance-data/config/mcp_config.json
+.pg/
+# ---------- 本地运行产物 ----------
+.runtime/
+.taste-skill/
+logs/
+reports/
+backup/
+uvicorn.*.log
+
+# ---------- 生成的图表 / 静态产物 ----------
+agentscope-pipeline*
+agentscope-react-loop.html
+
+# ---------- 根目录排障脚本（保留在本地，不入库） ----------
+/_*.py
+/_*.txt
+/_*.json
+/.patch.tmp
+*.tmp
+
+# ---------- 第三方源码克隆（上游 AgentScope） ----------
+agentscope/

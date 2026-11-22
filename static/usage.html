@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>用量与限额 · 投研 Agent</title>
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body data-page="usage">
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-mark">IA</span>
+        <div>
+          <div class="brand-title">投研 Agent</div>
+          <div class="brand-sub">iFinD research desk</div>
+        </div>
+      </div>
+      <a class="btn btn-block" href="/ui/">← 返回工作台</a>
+      <div class="section-label">账户</div>
+      <div class="sidebar-links">
+        <a class="sidebar-link active" href="/ui/usage">用量与限额</a>
+      </div>
+      <div class="sidebar-foot">
+        <div class="user-row">
+          <span class="user-dot" aria-hidden="true"></span>
+          <div class="user-copy">
+            <div class="user-email" id="userEmail"></div>
+            <div class="user-tenant" id="userTenant"></div>
+          </div>
+        </div>
+      </div>
+    </aside>
+
+    <main class="usage-main">
+      <header class="usage-head">
+        <div>
+          <h1 class="usage-title">用量与限额</h1>
+          <p class="usage-sub" id="usageSub">最近 7 天 · 当前用户</p>
+        </div>
+        <div class="usage-actions">
+          <a class="btn" href="/ui/">工作台</a>
+          <button class="btn" id="logoutButton" type="button">退出</button>
+        </div>
+      </header>
+
+      <div class="error-banner" id="errorBanner" role="alert"></div>
+
+      <section class="usage-summary" aria-label="用量汇总">
+        <div class="metric-card"><div class="metric-label">今日提问</div><div class="metric-value" id="todayQuestions">—</div><div class="metric-unit">/ 50 次</div></div>
+        <div class="metric-card"><div class="metric-label">今日工具调用</div><div class="metric-value" id="todayTools">—</div><div class="metric-unit">/ 400 次</div></div>
+        <div class="metric-card"><div class="metric-label">今日 token</div><div class="metric-value" id="todayTokens">—</div><div class="metric-unit">prompt + completion</div></div>
+        <div class="metric-card"><div class="metric-label">今日模型调用</div><div class="metric-value" id="todayModels">—</div><div class="metric-unit" id="modelName">—</div></div>
+      </section>
+
+      <section class="usage-block">
+        <h2 class="block-title">每日明细</h2>
+        <table class="data-table">
+          <thead>
+            <tr><th>日期</th><th>提问</th><th>工具</th><th>模型</th><th>失败</th><th>prompt</th><th>completion</th><th>总延迟</th></tr>
+          </thead>
+          <tbody id="usageRows"></tbody>
+        </table>
+      </section>
+
+      <section class="usage-block">
+        <h2 class="block-title">当前限额</h2>
+        <div class="limit-list" id="limitList"></div>
+      </section>
+    </main>
+  </div>
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>

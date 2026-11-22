@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>登录 · 投研 Agent</title>
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body data-page="login">
+  <main class="auth-page">
+    <section class="auth-intro">
+      <div class="auth-brand">
+        <span class="brand-mark">IA</span>
+        <div>
+          <div class="brand-title">投研 Agent</div>
+          <div class="brand-sub">iFinD research desk</div>
+        </div>
+      </div>
+      <div class="auth-headline">
+        <div class="auth-kicker">EVIDENCE-FIRST RESEARCH</div>
+        <h1 class="auth-title">先取数，再回答。<br>每个数字都有出处。</h1>
+        <p class="auth-copy">面向个人与小型团队的多租户投研工作台。接入 iFinD 数据，按证据组织答案，保留工具调用与用量记录。第一版聚焦 A 股、指数与宏观。</p>
+      </div>
+      <div class="auth-foot">v1 · local workspace · evidence ledger</div>
+    </section>
+
+    <section class="auth-panel-wrap">
+      <div class="auth-panel">
+        <h2 id="authTitle">登录工作区</h2>
+        <p class="sub" id="authSub">使用已注册的邮箱继续。</p>
+        <p class="form-error" id="formError" role="alert"></p>
+        <form id="authForm">
+          <div class="field">
+            <label for="email">邮箱</label>
+            <input id="email" name="email" type="email" autocomplete="email" placeholder="you@example.com" required>
+          </div>
+          <div class="field">
+            <label for="password">密码</label>
+            <input id="password" name="password" type="password" autocomplete="current-password" placeholder="至少 8 位" minlength="8" required>
+          </div>
+          <div class="field" id="tenantField" hidden>
+            <label for="tenantName">工作区名称 <span style="color:#999">（可选）</span></label>
+            <input id="tenantName" name="tenantName" type="text" autocomplete="organization" placeholder="例如：我的研究台">
+          </div>
+          <button class="btn btn-primary btn-block" id="submitButton" type="submit">登录</button>
+        </form>
+        <p class="auth-switch">
+          <span id="switchCopy">还没有账号？</span>
+          <button class="text-button" id="switchMode" type="button">注册工作区</button>
+        </p>
+        <p class="auth-note">首次使用会创建独立租户。账号、会话、证据和用量只对当前租户可见。</p>
+      </div>
+    </section>
+  </main>
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>

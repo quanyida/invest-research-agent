@@ -1,0 +1,123 @@
+{
+  "version": "1.5.1",
+  "generated_at": "2026-11-17",
+  "domains": {
+    "stock": {
+      "label": "A股",
+      "tools": {
+        "search_stocks": {
+          "desc": "智能选股",
+          "example": "电子行业市值大于100亿"
+        },
+        "get_stock_summary": {
+          "desc": "股票信息摘要",
+          "example": "茅台财务状况"
+        },
+        "get_stock_info": {
+          "desc": "股票基本资料",
+          "example": "格力电器上市时间"
+        },
+        "get_stock_performance": {
+          "desc": "股票日频行情与技术指标",
+          "example": "三花智控近5日涨跌幅"
+        },
+        "get_stock_shareholders": {
+          "desc": "股本结构与股东数据",
+          "example": "光明乳业流通股占比"
+        },
+        "get_stock_financials": {
+          "desc": "财务数据与指标",
+          "example": "科大讯飞2025年三季度的ROE"
+        },
+        "get_risk_indicators": {
+          "desc": "风险定量指标",
+          "example": "航天电子在2026-03-19的夏普比率"
+        },
+        "get_stock_events": {
+          "desc": "上市公司重大事件类指标",
+          "example": "摩尔线程IPO首发股本数量"
+        },
+        "get_esg_data": {
+          "desc": "ESG评级数据",
+          "example": "诚意药业中诚信ESG评级"
+        },
+        "stock_highfreq_quotes": {
+          "desc": "A股股票行情数据的实时快照与高频序列",
+          "example": "300033.SZ,300059,贵州茅台"
+        }
+      }
+    },
+    "global": {
+      "label": "港美股",
+      "tools": {
+        "search_global_stocks": {
+          "desc": "港美股智能选股",
+          "example": "汽车行业且市盈率低于50"
+        },
+        "global_stock_profile": {
+          "desc": "港美股基本资料与股本结构",
+          "example": "智谱、minimax的所属行业、上市日期与发行价"
+        },
+        "global_stock_quotes": {
+          "desc": "港美股行情数据与技术指标",
+          "example": "苹果和特斯拉近10个交易日的涨跌幅、换手率"
+        },
+        "global_stock_financial": {
+          "desc": "港美股财务数据与估值指标",
+          "example": "Google和Meta在最新报告期的ROE、ROA、利润增速"
+        },
+        "global_stock_events": {
+          "desc": "港美股公告事件（IPO、回购、分红、ESG等）",
+          "example": "minimax的IPO日期、数量、价格及保荐人"
+        }
+      }
+    },
+    "index": {
+      "label": "指数与板块",
+      "tools": {
+        "index_data": {
+          "desc": "指数行情、技术指标与估值指标",
+          "example": "沪深300、中证2000过去10个交易日的涨跌幅和收盘点数"
+        },
+        "sector_data": {
+          "desc": "板块行情、财务分析与成分股指标",
+          "example": "医疗设备板块(中证行业)的成分股个数及过去5个交易日的成分股平均涨跌幅"
+        },
+        "index_highfreq_quotes": {
+          "desc": "指数行情数据的实时快照与高频序列",
+          "example": "000001.SH,000941,创业板指"
+        }
+      }
+    },
+    "macro": {
+      "label": "宏观与行业",
+      "tools": {
+        "search_edb": {
+          "desc": "指标搜索",
+          "example": "光模块产业链相关指标"
+        },
+        "get_edb_data": {
+          "desc": "指标数据查询",
+          "example": "光伏电池产量202301-202506"
+        }
+      }
+    },
+    "news": {
+      "label": "新闻与公告",
+      "tools": {
+        "search_news": {
+          "desc": "新闻资讯语义检索",
+          "example": "内容"
+        },
+        "search_notice": {
+          "desc": "公告语义检索",
+          "example": "内容"
+        },
+        "search_trending_news": {
+          "desc": "热点事件资讯查询",
+          "example": "关键词"
+        }
+      }
+    }
+  }
+}
