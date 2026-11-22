@@ -46,7 +46,7 @@ create table if not exists session_events (
   user_id uuid not null,
   conversation_id uuid not null,
   message_id uuid not null,
-  event text not nul
+  event text not null,
   data jsonb not null default '{}'::jsonb,
   created_at timestamptz not null default now()
 );

@@ -138,8 +138,8 @@ def get_settings() -> Settings:
         ifind_mcp_max_retries=_int("IFIND_MCP_MAX_RETRIES", 1),
         redis_url=os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0"),
         redis_prefix=os.getenv("REDIS_PREFIX", "ira"),
-        http_proxy=os.getenv("HTTP_PROXY", "http://127.0.0.1:10808"),
-        https_proxy=os.getenv("HTTPS_PROXY", "http://127.0.0.1:10808"),
+        http_proxy=os.getenv("HTTP_PROXY", ""),
+        https_proxy=os.getenv("HTTPS_PROXY", ""),
         # Deprecated: single-turn tool quota removed; kept for compatibility with old scripts.
         max_tool_calls=_int("MAX_TOOL_CALLS", 4),
         max_steps=_int("MAX_STEPS", 6),

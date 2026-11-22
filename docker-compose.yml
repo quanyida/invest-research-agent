@@ -1,0 +1,43 @@
+# 本地依赖：PostgreSQL + Redis
+# 用法：docker compose up -d
+#
+# 端口刻意映射到项目的默认值（55432 / 6379），
+# 这样 .env 不填 DATABASE_URL 也能直接跑起来。
+name: invest-research-agent
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ira-postgres
+    environment:
+      POSTGRES_USER: invest_admin
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:-invest_admin_dev}
+      POSTGRES_DB: postgres
+      TZ: Asia/Shanghai
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U invest_admin -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: ira-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  pgdata:
+  redisdata:
