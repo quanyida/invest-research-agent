@@ -30,7 +30,12 @@ def pretty_name(name: str) -> str:
 
 
 class AuditedTool(ToolBase):
-    """One tenant-scoped tool exposed to AgentScope with shared auditing."""
+    """One tenant-scoped tool exposed to AgentScope with shared auditing.
+
+    Web search is marked concurrency-safe so that several distinct queries
+    emitted in one model reply run at the same time. iFinD tools stay
+    sequential; the collector and budget are only mutated between awaits.
+    """
 
     is_read_only = True
     is_concurrency_safe = False
@@ -40,6 +45,7 @@ class AuditedTool(ToolBase):
         self.ctx = ctx
         self.executor = executor
         self.name = display_name(spec.name)
+        self.is_concurrency_safe = spec.provider == "web"
         if spec.provider == "ifind":
             suffix = " 直接查询 iFinD 结构化数据；参数必须符合 schema，不要编造参数。"
         else:

@@ -4,6 +4,7 @@ import hashlib
 import html
 import json
 import re
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -27,6 +28,12 @@ FRESHNESS_MAP = {
 MAX_QUERY_CHARS = 200
 MAX_RESULT_CHARS = 1200
 MAX_TOTAL_CHARS = 8000
+
+# Parallel searches are useful, but the upstream provider rate-limits bursts.
+# Every call runs in its own worker thread, so cap the number of in-flight
+# HTTP requests here instead of relying on the event loop.
+MAX_INFLIGHT_REQUESTS = 4
+_inflight = threading.BoundedSemaphore(MAX_INFLIGHT_REQUESTS)
 
 
 def _clean_text(value: Any, limit: int) -> str:
@@ -225,15 +232,20 @@ class WebSearchClient:
         last_error = "UPSTREAM_ERROR"
         for attempt in range(2):
             try:
-                with httpx.Client(
-                    trust_env=True,
-                    timeout=self.settings.web_search_timeout_seconds,
-                ) as client:
-                    response = client.post(
-                        self.settings.web_search_base_url,
-                        json=body,
-                        headers=headers,
-                    )
+                if not _inflight.acquire(timeout=30.0):
+                    raise RuntimeError("RATE_LIMITED")
+                try:
+                    with httpx.Client(
+                        trust_env=True,
+                        timeout=self.settings.web_search_timeout_seconds,
+                    ) as client:
+                        response = client.post(
+                            self.settings.web_search_base_url,
+                            json=body,
+                            headers=headers,
+                        )
+                finally:
+                    _inflight.release()
                 if response.status_code == 429 and attempt == 0:
                     time.sleep(1.0)
                     continue
