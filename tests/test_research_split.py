@@ -66,15 +66,20 @@ def test_research_returns_run_id_and_stream_url(monkeypatch):
     assert len(assistant) == 1
     assert assistant[0].status == "queued"
 
-def test_chat_and_research_share_enqueue_path(monkeypatch):
-    _patch_request(monkeypatch)
+def test_chat_does_not_enqueue_and_starts_running(monkeypatch):
+    db = _patch_request(monkeypatch)
     calls: list[int] = []
     monkeypatch.setattr(chat.run_queue, "enqueue", lambda *_a, **_k: calls.append(1) or RUN)
 
-    chat.research(chat.ChatBody(message="问题一"), _Request())
-    chat.chat(chat.ChatBody(message="问题二"), _Request())
+    response = chat.chat(chat.ChatBody(message="问题二"), _Request())
 
-    assert len(calls) == 2
+    assert isinstance(response, StreamingResponse)
+    assert calls == []
+    assistant = [
+        item for item in db.added if getattr(item, "role", None) == "assistant"
+    ]
+    assert len(assistant) == 1
+    assert assistant[0].status == "running"
 
 def test_research_stream_rejects_unknown_run(monkeypatch):
     _patch_request(monkeypatch)

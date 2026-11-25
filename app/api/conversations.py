@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
+from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import case, select
+from sqlalchemy import case, select, text
 
 from app.agent.citation_support import build_citation_support
+from app.agent.persist import mark_assistant_failed_in_session
 from app.api.deps import check_origin, require_principal
+from app.config import get_settings
 from app.db import tenant_scope
 from app.models import Conversation, Evidence, Message
 from app.tools.channels import resolve_channel
@@ -30,6 +33,35 @@ def _conversation_payload(row: Conversation) -> dict:
         "updated_at": row.updated_at.isoformat(),
     }
 
+
+def _mark_orphan_messages(db: Any, rows: list[Message]) -> int:
+    """把超时的 running 消息就地标为失败。
+
+    只处理没有 chat_runs 的记录：research 任务由租约回收负责。
+    """
+    threshold = max(0.0, float(get_settings().orphan_threshold_seconds))
+    now = datetime.now(timezone.utc)
+    marked = 0
+    for row in rows:
+        if row.status != "running" or row.updated_at is None:
+            continue
+        if (now - row.updated_at).total_seconds() <= threshold:
+            continue
+        has_run = db.scalar(
+            text("select count(*) from chat_runs where message_id = :id"),
+            {"id": str(row.id)},
+        )
+        if has_run:
+            continue
+        if mark_assistant_failed_in_session(
+            db,
+            row.id,
+            "failed",
+            "CHAT_ORPHANED",
+            "执行中断，请重试。",
+        ):
+            marked += 1
+    return marked
 
 def _message_turn(row: Message) -> int | None:
     meta = row.meta if isinstance(row.meta, dict) else {}
@@ -153,6 +185,7 @@ def list_messages(conversation_id: uuid.UUID, request: Request) -> dict:
             .where(Message.conversation_id == conversation_id)
             .order_by(Message.created_at, role_order, Message.id)
         ).all()
+        _mark_orphan_messages(db, list(messages))
         evidence_rows = db.scalars(
             select(Evidence)
             .where(Evidence.message_id.in_([item.id for item in messages]))

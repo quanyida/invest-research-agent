@@ -9,7 +9,7 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from app.agent.persist import mark_assistant_failed_in_session
+from app.agent.persist import failed_message_payload, mark_assistant_failed_in_session
 from app.db import session_scope, tenant_scope
 
 logger = logging.getLogger(__name__)
@@ -197,6 +197,90 @@ def sweep(max_attempts: int) -> list[tuple[QueueTicket, str]]:
                 )
             recovered.append((ticket, state))
     return recovered
+
+def _known_tenants(db: Session) -> list[tuple[str, str]]:
+    """跨租户作业的租户清单只能取自无 RLS 的 chat_runs。
+
+    messages / session_events 都是强制 RLS，没有 app.tenant_id 时一行也看不到。
+    """
+    rows = db.execute(text("select distinct tenant_id, user_id from chat_runs")).all()
+    return [(str(row[0]), str(row[1])) for row in rows]
+
+def _scope(db: Session, tenant_id: str, user_id: str) -> None:
+    db.execute(
+        text(
+            "select set_config('app.tenant_id', :tenant_id, true),"
+            " set_config('app.user_id', :user_id, true)"
+        ),
+        {"tenant_id": tenant_id, "user_id": user_id},
+    )
+
+def sweep_orphan_messages(timeout_seconds: float) -> int:
+    """把长期停在 running 且没有 chat_runs 的消息标记为失败。
+
+    ``/chat`` 不写 ``chat_runs``，所以租约回收扫不到它；这里是后台兜底。
+    messages 是强制 RLS，只能逐租户 set_config 后再更新；纯 /chat 租户
+    没有 chat_runs 行，其孤儿由读取时的 90 秒检测兜底。
+    """
+    timeout = max(0.0, float(timeout_seconds))
+    content, meta = failed_message_payload("CHAT_ORPHANED", "执行中断，请重试。")
+    marked = 0
+    with session_scope() as db:
+        for tenant_id, user_id in _known_tenants(db):
+            _scope(db, tenant_id, user_id)
+            result = db.execute(
+                text(
+                    "update messages m"
+                    "   set status = 'failed',"
+                    "       content = :content,"
+                    "       meta = m.meta || cast(:meta as jsonb),"
+                    "       updated_at = now()"
+                    " where m.status = 'running'"
+                    "   and m.updated_at < now() - (:timeout * interval '1 second')"
+                    "   and not exists ("
+                    "       select 1 from chat_runs r where r.message_id = m.id"
+                    "   )"
+                ),
+                {
+                    "content": content,
+                    "meta": json.dumps(meta, ensure_ascii=False),
+                    "timeout": timeout,
+                },
+            )
+            marked += int(result.rowcount or 0)
+    return marked
+
+def mark_events_expiring(
+    tenant_id: uuid.UUID,
+    user_id: uuid.UUID,
+    message_id: uuid.UUID,
+    hours: int = 24,
+) -> int:
+    """任务终态后给回放事件打上过期时间。
+
+    落库时已标一次，但部分事件（usage/done 等）在 persist 之后才写入，
+    这里在流结束后补齐。
+    """
+    with tenant_scope(tenant_id, user_id) as db:
+        result = db.execute(
+            text(
+                "update session_events"
+                "   set expires_at = now() + (:hours * interval '1 hour')"
+                " where message_id = :message_id and expires_at is null"
+            ),
+            {"hours": int(hours), "message_id": str(message_id)},
+        )
+        return int(result.rowcount or 0)
+
+def purge_expired_events() -> int:
+    """删除已过期的回放事件（research 任务终态 24 小时后）。"""
+    purged = 0
+    with session_scope() as db:
+        for tenant_id, user_id in _known_tenants(db):
+            _scope(db, tenant_id, user_id)
+            result = db.execute(text("delete from session_events where expires_at < now()"))
+            purged += int(result.rowcount or 0)
+    return purged
 
 def append_event(ticket: QueueTicket, event: str, data: dict[str, Any]) -> None:
     payload = json.dumps(data, ensure_ascii=False, default=str)

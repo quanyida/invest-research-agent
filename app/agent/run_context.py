@@ -35,8 +35,9 @@ def build_run_context(run: Any, settings: Settings, gateway: IfindGateway) -> Ru
     turn = max(1, int(getattr(run, "turn", 1) or 1))
     allowed = resolve_agentscope_tools()
     budget = Budget(
-        timeout_seconds=settings.task_timeout_seconds,
+        timeout_seconds=float(getattr(run, "timeout_seconds", None) or settings.task_timeout_seconds),
         max_models=max(4, settings.max_steps * 2),
+        convergence_seconds=getattr(run, "convergence_seconds", None),
     )
     return RunContext(
         run=run,

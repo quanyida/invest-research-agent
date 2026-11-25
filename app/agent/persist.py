@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -30,6 +31,15 @@ def json_safe(value: Any) -> Any:
     if isinstance(value, Decimal):
         return str(value)
     return value
+
+_PREVIEW_CITATION_RE = re.compile(r"[\[(（【]\s*E\s*\d+\s*[-–—]\s*\d+\s*[\])）】]")
+_PREVIEW_WHITESPACE_RE = re.compile(r"\s+")
+
+def message_preview(text: str, limit: int = 80) -> str:
+    """Remove citation markers and collapse whitespace for the conversation list."""
+    value = _PREVIEW_CITATION_RE.sub("", str(text or ""))
+    value = _PREVIEW_WHITESPACE_RE.sub(" ", value).strip()
+    return value[:limit]
 
 def run_terminal_status(status: str) -> str:
     """Map a message status to the chat_runs terminal status."""
@@ -219,6 +229,15 @@ def persist_turn(
             conversation.updated_at = datetime.now(timezone.utc)
             if conversation.title in {"", "新会话"}:
                 conversation.title = question[:36]
+            db.execute(
+                text(
+                    "update conversations "
+                    "set last_message_preview = coalesce(nullif(:preview, ''), last_message_preview), "
+                    "    message_count = (select count(*) from messages where conversation_id = :id) "
+                    "where id = :id"
+                ),
+                {"preview": message_preview(answer), "id": conversation_id},
+            )
 
         state_saved: bool | None = None
         if agent_state is not None and agent_state_version is not None:
@@ -289,6 +308,15 @@ def persist_turn(
                 params,
             )
             run_finalized = int(result.rowcount or 0) == 1
+            if run_finalized:
+                db.execute(
+                    text(
+                        "update session_events "
+                        "set expires_at = now() + interval '24 hours' "
+                        "where message_id = :message_id and expires_at is null"
+                    ),
+                    {"message_id": str(message_id)},
+                )
             if not run_finalized:
                 raise RunFenced(
                     f"run {run_id} is not owned by worker {worker_id} (attempt {attempt})"
@@ -324,6 +352,7 @@ def mark_assistant_failed_in_session(
     row.content = content
     row.status = status
     row.meta = meta
+    row.updated_at = datetime.now(timezone.utc)
     return True
 
 def mark_assistant_failed(

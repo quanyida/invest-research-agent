@@ -17,7 +17,7 @@ from openai import APITimeoutError
 
 from app.agent.context_pruning import ContextPruningMiddleware
 from app.agent.context_probe import ContextProbeMiddleware
-from app.agent.time_budget import TimeBudgetMiddleware
+from app.agent.time_budget import CONVERGENCE_SECONDS, TimeBudgetMiddleware
 from app.agent.history_context import (
     SUMMARY_SYSTEM_PROMPT,
     chunk_turns,
@@ -536,7 +536,7 @@ class AgentScopeRunner:
             "conversation_id": str(run.conversation_id),
             "message_id": str(run.message_id),
             "request_id": str(run.request_id),
-            "timeout_seconds": self.settings.task_timeout_seconds,
+            "timeout_seconds": ctx.budget.timeout_seconds,
             "turn": ctx.turn,
             "agent_state_version": state_version,
             "agent_state_rebuilt": state_rebuilt,
@@ -579,7 +579,10 @@ class AgentScopeRunner:
                 if getattr(item, "role", "") == "user"
             ],
         )
-        time_budget = TimeBudgetMiddleware(ctx.budget)
+        time_budget = TimeBudgetMiddleware(
+            ctx.budget,
+            ctx.budget.convergence_seconds or CONVERGENCE_SECONDS,
+        )
 
         if ctx.plan.unsupported:
             final_answer = unsupported_answer(ctx.plan.note)
@@ -638,7 +641,7 @@ class AgentScopeRunner:
                     raise RuntimeError(f"AGENT_FINISHED_{finished_reason.upper()}")
 
             try:
-                async with asyncio.timeout(self.settings.task_timeout_seconds):
+                async with asyncio.timeout(ctx.budget.timeout_seconds):
                     final_msg = None
                     async for event_name, data in drive(agent, run.question):
                         if event_name == "_final_msg":
@@ -791,7 +794,7 @@ class AgentScopeRunner:
                 timeout_seconds = (
                     self.settings.llm_timeout_seconds
                     if model_timeout
-                    else self.settings.task_timeout_seconds
+                    else ctx.budget.timeout_seconds
                 )
                 logger.warning(
                     "agent %s timed out after %.1fs; returning evidence digest",
@@ -861,7 +864,7 @@ class AgentScopeRunner:
             }
         )
 
-        async with asyncio.timeout(self.settings.task_timeout_seconds):
+        async with asyncio.timeout(ctx.budget.timeout_seconds):
             saved, state_skipped, run_finalized = await self._persist(
                 run,
                 ctx,

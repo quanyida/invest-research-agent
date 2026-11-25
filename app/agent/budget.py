@@ -11,6 +11,7 @@ class Budget:
     timeout_seconds: float
     max_tools: int | None = None
     max_models: int = 4
+    convergence_seconds: float | None = None
     started: float = field(default_factory=time.monotonic)
     tools_used: int = 0
     models_used: int = 0

@@ -5,6 +5,7 @@ import contextlib
 import logging
 import os
 import socket
+import time
 import uuid
 from typing import Any, AsyncIterator
 
@@ -18,8 +19,11 @@ from app.agent.run_queue import (
     append_event,
     claim,
     finish,
+    mark_events_expiring,
+    purge_expired_events,
     run_status,
     sweep,
+    sweep_orphan_messages,
 )
 from app.config import Settings, get_settings
 from app.db import tenant_scope
@@ -28,6 +32,8 @@ from app.models import Message
 logger = logging.getLogger(__name__)
 
 _LEGACY_DONE = object()
+ORPHAN_SWEEP_INTERVAL_SECONDS = 60.0
+EVENT_PURGE_INTERVAL_SECONDS = 600.0
 
 def _next_event(iterator: Any) -> Any:
     try:
@@ -128,6 +134,8 @@ class RunWorker:
             await asyncio.wait_for(self._stopping.wait(), timeout=max(0.05, seconds))
 
     async def _loop(self) -> None:
+        last_orphan_sweep = 0.0
+        last_event_purge = 0.0
         while not self._stopping.is_set():
             try:
                 recovered = await asyncio.to_thread(sweep, self.settings.run_max_attempts)
@@ -138,6 +146,21 @@ class RunWorker:
                         ticket.attempt,
                         state,
                     )
+
+                now = time.monotonic()
+                if now - last_orphan_sweep >= ORPHAN_SWEEP_INTERVAL_SECONDS:
+                    last_orphan_sweep = now
+                    orphans = await asyncio.to_thread(
+                        sweep_orphan_messages,
+                        self.settings.orphan_sweep_seconds,
+                    )
+                    if orphans:
+                        logger.warning("marked %s orphan chat message(s) as failed", orphans)
+                if now - last_event_purge >= EVENT_PURGE_INTERVAL_SECONDS:
+                    last_event_purge = now
+                    purged = await asyncio.to_thread(purge_expired_events)
+                    if purged:
+                        logger.info("purged %s expired session event(s)", purged)
 
                 ticket = await asyncio.to_thread(
                     claim,
@@ -207,11 +230,17 @@ class RunWorker:
                 "Agent 执行异常，请稍后重试。",
             )
             await asyncio.to_thread(
+                mark_events_expiring, ticket.tenant_id, ticket.user_id, ticket.message_id
+            )
+            await asyncio.to_thread(
                 finish, ticket.run_id, "failed",
                 error_code=type(exc).__name__, error_message=str(exc),
             )
             return
 
+        await asyncio.to_thread(
+            mark_events_expiring, ticket.tenant_id, ticket.user_id, ticket.message_id
+        )
         if run_finalized:
             return
         if not done:
@@ -234,6 +263,9 @@ class RunWorker:
                 "error",
                 "PERSIST_FAILED",
                 "回答保存失败，请稍后重试。",
+            )
+            await asyncio.to_thread(
+                mark_events_expiring, ticket.tenant_id, ticket.user_id, ticket.message_id
             )
             await asyncio.to_thread(
                 finish,

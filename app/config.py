@@ -109,6 +109,10 @@ class Settings:
     run_max_attempts: int
     event_poll_seconds: float
     event_tail_timeout_seconds: float
+    agent_service_url: str
+    chat_timeout_seconds: float
+    orphan_threshold_seconds: float
+    orphan_sweep_seconds: float
     web_search_enabled: bool
     web_search_provider: str
     web_search_base_url: str
@@ -181,6 +185,10 @@ def get_settings() -> Settings:
         run_max_attempts=_int("RUN_MAX_ATTEMPTS", 2),
         event_poll_seconds=_float("EVENT_POLL_SECONDS", 0.15),
         event_tail_timeout_seconds=_float("EVENT_TAIL_TIMEOUT_SECONDS", 600.0),
+        agent_service_url=os.getenv("AGENT_SERVICE_URL", "http://127.0.0.1:8001").rstrip("/"),
+        chat_timeout_seconds=_float("CHAT_TIMEOUT_SECONDS", 60.0),
+        orphan_threshold_seconds=_float("ORPHAN_THRESHOLD_SECONDS", 90.0),
+        orphan_sweep_seconds=_float("ORPHAN_SWEEP_SECONDS", 3600.0),
         web_search_enabled=_bool("WEB_SEARCH_ENABLED", True),
         web_search_provider=os.getenv("WEB_SEARCH_PROVIDER", "tavily").strip().lower(),
         web_search_base_url=os.getenv(

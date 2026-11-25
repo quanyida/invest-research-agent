@@ -49,6 +49,8 @@ class ChatRun:
     run_id: uuid.UUID | None = None
     worker_id: str | None = None
     attempt: int | None = None
+    timeout_seconds: float | None = None
+    convergence_seconds: float | None = None
 
 def _json_safe(value: Any) -> Any:
     if isinstance(value, dict):
@@ -112,8 +114,9 @@ class AgentLoop:
 
     def stream(self, run: ChatRun) -> Iterator[tuple[str, dict[str, Any]]]:
         budget = Budget(
-            timeout_seconds=self.settings.task_timeout_seconds,
+            timeout_seconds=float(run.timeout_seconds or self.settings.task_timeout_seconds),
             max_models=self.settings.model_max_attempts,
+            convergence_seconds=run.convergence_seconds,
         )
         trace: list[dict[str, Any]] = []
         state: dict[str, Any] = {
