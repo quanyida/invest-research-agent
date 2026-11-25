@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from app.agent.answer_format import SECTION_PATTERNS
 from app.agent.context import degraded_answer, no_evidence_answer
 from app.agent.citation_support import build_citation_support
 from app.agent.verify import VerifyResult, repair_citations, verify_answer, verify_raw_answer
@@ -30,9 +31,9 @@ def _clean(text: str) -> str:
 
 def extract_answer(text: str) -> str:
     value = _clean(text)
-    marker = value.find("结论：")
-    if marker >= 0:
-        value = value[marker:]
+    match = SECTION_PATTERNS[0].search(value)
+    if match is not None:
+        value = value[match.start():]
     return value.strip()
 
 def guard_answer(
@@ -86,9 +87,10 @@ def revision_message(draft: str, issues: list[str]) -> str:
         "不要解释修订过程。\n\n"
         f"校验问题：\n{issue_text}\n\n"
         f"上一版答案：\n{draft[:6000]}\n\n"
-        "请输出修正后的最终答案，严格四段纯文本：结论：/依据：/关键数据：/待确认：。"
+        "请输出修正后的最终答案，用 Markdown 自由组织，结构由你根据问题的性质决定；"
+        "允许加粗、斜体、标题、列表、引用块和行内代码，禁止代码块、表格、图片和 []() 超链接。"
         "删除无法由 observation 中 fact 支持的数字或句子；每个保留的数字后必须紧跟 [E轮次-序号]。"
-        "“待确认”只写数据口径、缺失和分歧，不要把校验问题本身写进答案。"
+        "数据口径、缺失和分歧直接写清，不要把校验问题本身写进答案。"
     )
 
 

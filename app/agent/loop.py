@@ -110,27 +110,6 @@ class AgentLoop:
             value = "\n".join(lines).strip()
         return value
 
-    @staticmethod
-    def _ensure_sections(text: str) -> str:
-        value = text
-        if "依据：" not in value:
-            marker = next((item for item in ("关键数据：", "待确认：") if item in value), None)
-            block = "依据：见结论。"
-            if marker:
-                value = value.replace(marker, block + "\n" + marker, 1)
-            else:
-                value = value.rstrip() + "\n" + block
-        if "关键数据：" not in value:
-            marker = "待确认：" if "待确认：" in value else None
-            block = "关键数据：本轮无关键数字。"
-            if marker:
-                value = value.replace(marker, block + "\n" + marker, 1)
-            else:
-                value = value.rstrip() + "\n" + block
-        if "待确认：" not in value:
-            value = value.rstrip() + "\n待确认：数据来自 iFinD，具体口径以原始数据为准。"
-        return value
-
     def stream(self, run: ChatRun) -> Iterator[tuple[str, dict[str, Any]]]:
         budget = Budget(
             timeout_seconds=self.settings.task_timeout_seconds,
@@ -231,7 +210,6 @@ class AgentLoop:
 
         draft = self._clean_text(result.content)
         draft, citation_repairs = repair_citations(draft, evidences)
-        draft = self._ensure_sections(draft)
         verify_result = verify_answer(draft, evidences)
         repaired = False
         if not verify_result.passed and budget.models_remaining > 0 and budget.remaining() > 5:
@@ -251,7 +229,6 @@ class AgentLoop:
             if repair_result is not None:
                 repaired_text = self._clean_text(repair_result.content)
                 repaired_text, repair_count = repair_citations(repaired_text, evidences)
-                repaired_text = self._ensure_sections(repaired_text)
                 citation_repairs += repair_count
                 repaired_verify = verify_answer(repaired_text, evidences)
                 repaired = True

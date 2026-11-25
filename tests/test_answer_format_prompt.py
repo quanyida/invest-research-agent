@@ -9,36 +9,34 @@ FACTS = [
 ]
 EVIDENCES = [{"facts": FACTS}]
 
-
-def test_prompt_requires_new_four_sections():
+def test_prompt_has_no_four_section_template():
     for label in ("结论：", "依据：", "关键数据：", "待确认："):
-        assert label in SYSTEM_PROMPT
+        assert label not in SYSTEM_PROMPT
+    assert "结构由你根据问题的性质自行决定" in SYSTEM_PROMPT
 
-
-def test_prompt_defines_company_and_industry_skeletons():
+def test_prompt_does_not_impose_answer_skeleton():
     for head in ("核心逻辑：", "业务与财务：", "驱动与催化：", "可比与估值：", "跟踪指标："):
-        assert head in SYSTEM_PROMPT
+        assert head not in SYSTEM_PROMPT
     for head in ("行业全景：", "商业模式：", "政策环境：", "产业链：", "空间测算：", "竞争格局：", "核心标的："):
-        assert head in SYSTEM_PROMPT
+        assert head not in SYSTEM_PROMPT
 
-
-def test_agent_prompt_mentions_task_templates_and_two_line_boundary():
+def test_agent_prompt_does_not_impose_section_template():
     ctx = SimpleNamespace(
         settings=SimpleNamespace(max_tool_calls=4),
         turn=2,
         allowed_tools=["ifind.stock_financials"],
     )
     prompt = build_agent_system_prompt(ctx)
-    assert "依据：" in prompt
-    assert "关键数据：" in prompt
-    assert "待确认：" in prompt
-    assert "小标题" in prompt
+    for label in ("结论：", "依据：", "关键数据：", "待确认："):
+        assert label not in prompt
+    assert "Markdown" in prompt
+    assert "结构由你根据问题的性质自行决定" in prompt
 
-
-def test_repair_prompt_targets_two_line_boundary():
+def test_repair_prompt_does_not_require_four_sections():
     messages = build_repair_messages("问题", EVIDENCES, "初稿", ["缺引用"])
-    assert "待确认：" in messages[-1]["content"]
-
+    content = messages[-1]["content"]
+    assert "待确认：" not in content
+    assert "Markdown" in content
 
 def test_legacy_answer_still_passes_verification():
     answer = (

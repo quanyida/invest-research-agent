@@ -5,6 +5,11 @@ from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from app.agent.answer_format import (
+    LEGACY_SECTION_PATTERNS,
+    section_body,
+)
+
 
 CITATION_OPEN = r"[\[（(]"
 CITATION_CLOSE = r"[\]）)]"
@@ -245,13 +250,6 @@ def strip_citations(text: str) -> str:
     return CITATION_LIKE_RE.sub("", str(text or ""))
 
 
-def _format_issues(text: str) -> list[str]:
-    new_labels = ("结论：", "依据：", "关键数据：", "待确认：")
-    old_labels = ("结论：", "关键数字：", "正文：", "边界：")
-    if all(label in text for label in new_labels) or all(label in text for label in old_labels):
-        return []
-    return ["缺少四段格式：结论：/依据：/关键数据：/待确认："]
-
 
 def citation_only_issues(result: VerifyResult) -> bool:
     """True when the only problem is that invalid citations were removed."""
@@ -325,7 +323,8 @@ def verify_raw_answer(
 
     if removed_count:
         issues.append(f"已移除 {removed_count} 条无法核实的引用")
-    issues.extend(_format_issues(text))
+    if evidence_ids and not cited:
+        issues.append("answer_has_no_citation: 回答没有任何有效引用")
     issues = list(dict.fromkeys(issues))
     return text, VerifyResult(
         passed=not issues,
@@ -346,14 +345,11 @@ def verify_answer(answer: str, evidences: list[dict[str, Any]]) -> VerifyResult:
     unverified: list[dict[str, str]] = []
     cited: list[str] = []
 
-    new_labels = ("结论：", "依据：", "关键数据：", "待确认：")
-    old_labels = ("结论：", "关键数字：", "正文：", "边界：")
-    if not all(label in text for label in new_labels) and not all(
-        label in text for label in old_labels
-    ):
-        issues.append("缺少四段格式：结论：/依据：/关键数据：/待确认：")
-    conclusion = text.split("依据：", 1)[0] if "依据：" in text else text.split("关键数字：", 1)[0]
-    if "结论：" in conclusion and not CITATION_RE.search(conclusion):
+
+    conclusion = section_body(text, 0)
+    if conclusion is None:
+        conclusion = section_body(text, 0, LEGACY_SECTION_PATTERNS)
+    if conclusion is not None and not CITATION_RE.search(conclusion):
         issues.append("结论段没有 fact 级引用")
 
     for citation in CITATION_RE.findall(text):
@@ -435,7 +431,7 @@ def verify_answer(answer: str, evidences: list[dict[str, Any]]) -> VerifyResult:
             unverified.append({"fact_id": fact_id, "reason": reason})
 
     if not cited:
-        issues.append("回答没有任何 fact 级引用")
+        issues.append("answer_has_no_citation: 回答没有任何 fact 级引用")
     passed = not issues and bool(cited)
     return VerifyResult(
         passed=passed,
