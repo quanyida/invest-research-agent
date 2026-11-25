@@ -8,35 +8,81 @@ from app.agent.evidence_collector import ToolRecord
 from app.agent.run_context import RunContext
 from app.tools.web_search import MAX_QUERY_CHARS, get_web_search
 
-LEADING_PREFIXES = (
-    "请帮我",
-    "帮我",
-    "麻烦",
-    "请问",
-    "我想知道",
-    "想问一下",
-    "告诉我",
-    "详细",
-    "深度",
-    "分析一下",
-    "分析下",
-    "分析",
-    "研究一下",
-    "研究",
-    "看看",
-    "查一下",
-    "查询",
+INSTRUCTION_PHRASES = tuple(
+    sorted(
+        {
+            "多渠道交叉验证",
+            "对比分析下",
+            "帮我",
+            "请帮我",
+            "麻烦",
+            "请问",
+            "我想知道",
+            "想问一下",
+            "告诉我",
+            "对比分析",
+            "分析一下",
+            "分析下",
+            "各方面",
+            "多渠道",
+            "交叉验证",
+            "详细",
+            "深度",
+            "梳理",
+            "总结",
+            "看看",
+            "查一下",
+            "查询",
+            "研究一下",
+            "研究",
+            "一下",
+        },
+        key=len,
+        reverse=True,
+    )
 )
+
+_STRUCTURAL_WORDS = {"的", "在", "和", "与", "以及"}
+_STRUCTURAL_RE = re.compile(
+    r"(?<=[\u4e00-\u9fff])(?:以及|的|在|和|与)(?=[\u4e00-\u9fff])"
+    r"|(?<=[A-Za-z0-9])(?:以及|的|在|和|与)(?=[\u4e00-\u9fff])"
+    r"|(?<=[\u4e00-\u9fff])(?:以及|的|在|和|与)(?=[A-Za-z0-9])"
+)
+_PUNCTUATION_RE = re.compile(r"[，,。；;：:、！？?!（）()\[\]【】{}<>/\\|\n\r\t]+")
+_PERIOD_RE = re.compile(r"20\d{2}(?:Q[1-4]|H[1-2]|年)?")
+_SPACE_RE = re.compile(r"\s+")
 
 
 def build_prefetch_query(question: str) -> str:
-    """Build a deterministic web query without spending another model call."""
-    value = re.sub(r"\s+", " ", str(question or "")).strip()
-    for prefix in LEADING_PREFIXES:
-        if value.startswith(prefix):
-            value = value[len(prefix) :].lstrip("：:，,。 ")
-    value = value or str(question or "").strip()
-    return value[:MAX_QUERY_CHARS].strip()
+    """Build a deterministic keyword query without spending another model call."""
+    original = _SPACE_RE.sub(" ", str(question or "")).strip()
+    if not original:
+        return ""
+    value = original
+    for phrase in INSTRUCTION_PHRASES:
+        value = value.replace(phrase, " ")
+    value = _PUNCTUATION_RE.sub(" ", value)
+    value = _STRUCTURAL_RE.sub(" ", value)
+    value = _PERIOD_RE.sub(lambda match: f" {match.group(0)} ", value)
+
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for token in _SPACE_RE.split(value):
+        token = token.strip(" \t\r\n-_")
+        if token.endswith("的") and len(token) > 1:
+            token = token[:-1].rstrip()
+        if not token or token in _STRUCTURAL_WORDS:
+            continue
+        key = token.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        tokens.append(token)
+
+    meaningful = [token for token in tokens if len(token) >= 2]
+    if len(meaningful) < 2:
+        return original[:MAX_QUERY_CHARS].strip()
+    return " ".join(tokens)[:MAX_QUERY_CHARS].strip()
 
 
 async def prefetch_web(ctx: RunContext) -> ToolRecord | None:
