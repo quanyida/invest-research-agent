@@ -17,6 +17,7 @@ from openai import APITimeoutError
 
 from app.agent.context_pruning import ContextPruningMiddleware
 from app.agent.context_probe import ContextProbeMiddleware
+from app.agent.time_budget import TimeBudgetMiddleware
 from app.agent.history_context import (
     SUMMARY_SYSTEM_PROMPT,
     chunk_turns,
@@ -38,7 +39,7 @@ from app.agent.agent_state_store import (
     reset_turn_marks,
     state_was_truncated,
 )
-from app.agent.answer_format import SECTION_LABELS, SECTION_PATTERNS, answer_is_complete
+from app.agent.answer_format import answer_is_complete
 from app.agent.answer_guard import (
     digest_answer,
     guard_answer,
@@ -73,7 +74,7 @@ SUMMARY_MAX_TOKENS = 3000
 GAP_REBUILD_TURNS = 3
 SYNTHESIS_SYSTEM_PROMPT = """你是一名严谨的卖方研究助理。本轮只做最终成文，不得调用任何工具。
 你只能使用用户消息中 <tool_observation> 里的 iFinD 与公开网页原始数据，不得编造数据。
-严格输出四段纯文本：结论：/依据：/关键数据：/待确认：；不要 Markdown、不要过程说明。
+用 Markdown 自由组织答案，结构由你根据问题的性质决定；允许加粗、斜体、标题、列表、引用块和行内代码，禁止代码块、表格、图片和 []() 超链接；不要过程说明；有证据时至少出现一处有效引用。
 引用来源只能使用本轮 <tool_observation call="..."> 给出的编号，括号内只写编号本身（如 [E3-1]）。
 不得引用历史轮次编号（历史编号已失效），不得在括号内附带媒体名、日期或链接，不得编造编号。
 """
@@ -126,9 +127,9 @@ def _synthesis_prompt(
         f"{question_block}"
         "本轮工具调用已结束。请只基于以下 iFinD 与公开网页原始数据，把上一版草稿补全为完整最终答案，不要再调用工具。\n"
         "用户问题中的标的是唯一分析对象，不得写其他公司。\n"
-        "严格四段：结论：/依据：/关键数据：/待确认：；不要 Markdown、不要过程说明。\n\n"
+        "用 Markdown 自由组织答案，结构由你根据问题的性质决定；允许加粗、斜体、标题、列表、引用块和行内代码，禁止代码块、表格、图片和 []() 超链接；不要过程说明；有证据时至少出现一处有效引用。\n\n"
         f"{draft_block}{body}\n\n"
-        "请给出完整分析，不要只写半句；无法从原文确认的内容放入“待确认”。"
+        "请给出完整分析，不要只写半句；无法从原文确认的内容直接标明。"
     )
 
 
@@ -578,6 +579,7 @@ class AgentScopeRunner:
                 if getattr(item, "role", "") == "user"
             ],
         )
+        time_budget = TimeBudgetMiddleware(ctx.budget)
 
         if ctx.plan.unsupported:
             final_answer = unsupported_answer(ctx.plan.note)
@@ -601,7 +603,7 @@ class AgentScopeRunner:
                 state=state,
                 context_config=self._context_config(),
                 react_config=self._react_config(ctx),
-                middlewares=[context_middleware, probe],
+                middlewares=[context_middleware, time_budget, probe],
             )
             if state_rebuilt and recent_messages:
                 await agent.observe(recent_messages)
@@ -660,13 +662,8 @@ class AgentScopeRunner:
                     incomplete = not answer_is_complete(final_answer)
                     if incomplete:
                         logger.warning(
-                            "incomplete agent answer len=%d sections=%s head=%r tail=%r",
+                            "incomplete agent answer len=%d head=%r tail=%r",
                             len(final_answer),
-                            [
-                                label
-                                for label, pattern in zip(SECTION_LABELS, SECTION_PATTERNS)
-                                if pattern.search(final_answer)
-                            ],
                             final_answer[:400],
                             final_answer[-400:],
                         )
@@ -859,6 +856,7 @@ class AgentScopeRunner:
                 "answer_source": answer_source,
                 "context_compression": context_middleware.snapshot(),
                 "agent_state_prompt_probe": probe.snapshot(),
+                "time_budget": time_budget.snapshot(),
                 "elapsed_ms": int((time.monotonic() - started) * 1000),
             }
         )
