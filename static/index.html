@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
   <title>研究工作台 · 投研 Agent</title>
-  <link rel="stylesheet" href="/assets/app.css?v=1.17">
+  <link rel="stylesheet" href="/assets/app.css?v=1.19">
 </head>
 <body data-page="chat">
   <div class="app-shell">
@@ -72,9 +72,14 @@
 
       <div class="composer-wrap">
         <form class="composer" id="questionForm">
-          <textarea id="questionInput" rows="1" maxlength="2000" placeholder="问一个可验证的问题，例如：宁德时代 2025Q3 毛利率多少，同比变化？" aria-label="问题"></textarea>
-          <button class="btn btn-primary" id="sendButton" type="submit">发送</button>
+          <div class="composer-modes" role="radiogroup" aria-label="回答模式">
+            <button type="button" class="mode-option is-active" role="radio" aria-checked="true" data-mode="chat">聊天</button>
+            <button type="button" class="mode-option" role="radio" aria-checked="false" data-mode="research">深度研究</button>
+          </div>
+          <textarea id="questionInput" rows="1" maxlength="2000" placeholder="问一个可验证的问题，例如：宁德时代 2025Q3 毛利率多少，同比变化？" aria-label="问题" aria-describedby="researchNote"></textarea>
+          <button class="btn btn-primary" id="sendButton" type="submit"><span id="sendLabel">发送</span></button>
         </form>
+        <p class="composer-note" id="researchNote" hidden>深度研究耗时较长，可以离开页面，稍后回来查看。</p>
         <div class="composer-foot">
           <div class="composer-status" id="agentStatus">准备就绪</div>
           <div class="composer-hint">Enter 发送 · Shift+Enter 换行</div>
@@ -82,6 +87,6 @@
       </div>
     </main>
   </div>
-  <script src="/assets/app.js?v=1.18" defer></script>
+  <script src="/assets/app.js?v=1.19" defer></script>
 </body>
 </html>

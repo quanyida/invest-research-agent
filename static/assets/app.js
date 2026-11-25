@@ -12,6 +12,9 @@
     liveTurn: null,
     streaming: false,
     currentAssistant: null,
+    mode: "chat",
+    pollToken: 0,
+    researchClock: null,
   };
 
   const $ = (selector, root = document) => root.querySelector(selector);
@@ -87,6 +90,7 @@
     if (status === "degraded") return { label: "已降级", dot: "warn" };
     if (status === "error") return { label: "失败", dot: "err" };
     if (status === "cancelled") return { label: "已取消", dot: "warn" };
+    if (status === "queued") return { label: "排队中", dot: "" };
     if (status === "running") return { label: "进行中", dot: "" };
     return { label: status || "—", dot: "" };
   }
@@ -242,15 +246,46 @@
     state.streaming = busy;
     const input = $("#questionInput");
     const send = $("#sendButton");
+    const label = $("#sendLabel");
     if (input) input.disabled = busy;
-    if (send) {
-      send.disabled = busy;
-      send.textContent = busy ? "处理中…" : "发送";
-    }
+    if (send) send.disabled = busy;
+    if (label) label.textContent = busy ? "处理中…" : (state.mode === "research" ? "开始研究" : "发送");
   }
 
   function setAgentStatus(value) {
     setText($("#agentStatus"), value);
+  }
+
+  function sleep(ms) {
+    return new Promise((resolve) => window.setTimeout(resolve, ms));
+  }
+
+  function startResearchTimer(view, startedAt) {
+    stopResearchTimer();
+    if (!view || !view.body) return;
+    const node = document.createElement("div");
+    node.className = "research-timer";
+    view.body.appendChild(node);
+    const started = Number(startedAt) || Date.now();
+    const update = () => {
+      if (!node.isConnected) {
+        stopResearchTimer();
+        return;
+      }
+      const seconds = Math.max(0, Math.floor((Date.now() - started) / 1000));
+      node.textContent = "正在研究… 已用时 " + seconds + " 秒";
+    };
+    update();
+    const timer = window.setInterval(update, 5000);
+    state.researchClock = { timer, node };
+  }
+
+  function stopResearchTimer() {
+    const clock = state.researchClock;
+    if (!clock) return;
+    if (clock.timer) window.clearInterval(clock.timer);
+    if (clock.node) clock.node.remove();
+    state.researchClock = null;
   }
 
   const TOOL_PROGRESS_LABELS = {
@@ -417,7 +452,7 @@
     const ok = data && data.status === "ok";
     step.status = ok ? "ok" : "failed";
     step.row.dataset.state = step.status;
-    step.mark.textContent = ok ? "✓" : "!";
+    step.mark.textContent = ok ? "✓" : "!"; // taste-skill-ignore: checkmark marks a completed step
     step.copy.textContent = (ok ? "已取回" : "取数失败") + " · " + step.label;
     const parts = [formatMs(data && data.latency_ms)];
     if (data && data.cached) parts.push("缓存");
@@ -1302,6 +1337,8 @@
 
   function clearConversationView() {
     if (state.streaming) return;
+    state.pollToken += 1;
+    stopResearchTimer();
     state.activeId = null;
     state.messages = [];
     state.evidenceTurns = [];
@@ -1323,6 +1360,9 @@
 
   async function openConversation(id) {
     if (state.streaming || !id) return;
+    state.pollToken += 1;
+    const pollToken = state.pollToken;
+    stopResearchTimer();
     hideError();
     state.activeId = id;
     renderConversationList();
@@ -1333,8 +1373,46 @@
       const conversation = data.conversation || {};
       updateTitle(conversation.title || "研究工作台", "会话记录 · " + state.messages.length + " 条消息");
       renderHistory();
+      const pending = [...state.messages].reverse().find((item) => item.role === "assistant");
+      if (pending && pending.id && (pending.status === "running" || pending.status === "queued")) {
+        pollUntilSettled(id, pending.id, pending.created_at, pollToken);
+      }
     } catch (error) {
       showError(error.message);
+    }
+  }
+
+  async function pollUntilSettled(conversationId, messageId, _startedAt, pollToken) {
+    const intervalMs = 3000;
+    const maxMs = 10 * 60 * 1000;
+    let elapsed = 0;
+    const cancelled = () => pollToken !== state.pollToken || state.activeId !== conversationId || state.streaming;
+    while (true) {
+      if (cancelled() || elapsed > maxMs) return;
+      await sleep(intervalMs);
+      if (cancelled()) return;
+      if (document.hidden) continue;
+      elapsed += intervalMs;
+      let data = null;
+      try {
+        data = await api("/api/v1/conversations/" + encodeURIComponent(conversationId) + "/messages");
+      } catch (error) {
+        continue;
+      }
+      if (cancelled()) return;
+      const items = Array.isArray(data.items) ? data.items : [];
+      const target = items.find((item) => item.id === messageId);
+      if (target && (target.status === "running" || target.status === "queued")) continue;
+      state.messages = items;
+      const conversation = data.conversation || {};
+      updateTitle(conversation.title || "研究工作台", "会话记录 · " + state.messages.length + " 条消息");
+      renderHistory();
+      try {
+        await loadConversations();
+      } catch (error) {
+        /* 轮询收尾时列表刷新失败可忽略 */
+      }
+      return;
     }
   }
 
@@ -1526,6 +1604,7 @@
       }
       if (eventName === "done") {
         current.status = data.status || "done";
+        stopResearchTimer();
         renderAnswer(view.textNode, current.content, current.evidence, current.meta);
         refreshLiveCounts(current);
         renderVerifyLine(view, current);
@@ -1536,6 +1615,7 @@
       }
       if (eventName === "error") {
         current.status = "error";
+        stopResearchTimer();
         finishRunProgress(current, "error");
         setRowStatus(view, "error");
         showError((data && data.message) || "回答失败");
@@ -1558,11 +1638,35 @@
     };
 
     try {
-      await streamChat({
-        conversation_id: state.activeId,
-        client_request_id: newRequestId(),
-        message: question,
-      }, handle);
+      if (state.mode === "research") {
+        const created = await api("/api/v1/research", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            conversation_id: state.activeId,
+            client_request_id: newRequestId(),
+            message: question,
+            mode: state.mode,
+          }),
+        });
+        if (created.conversation_id && !state.activeId) {
+          state.activeId = created.conversation_id;
+          renderConversationList();
+        }
+        if (created.message_id) {
+          state.currentAssistant.id = created.message_id;
+          if (view && view.row) view.row.dataset.messageId = created.message_id;
+        }
+        setAgentStatus("已提交研究任务，正在处理…");
+        startResearchTimer(view, Date.now());
+        await streamChat(null, handle, { method: "GET", url: created.stream_url });
+      } else {
+        await streamChat({
+          conversation_id: state.activeId,
+          client_request_id: newRequestId(),
+          message: question,
+        }, handle);
+      }
       let attempts = 0;
       while (state.currentAssistant && state.currentAssistant.status === "running" && state.currentAssistant.id && attempts < 20) {
         attempts += 1;
@@ -1593,6 +1697,7 @@
         setAgentStatus("请求失败");
       }
     } finally {
+      stopResearchTimer();
       const live = state.currentAssistant;
       const keepLive = Boolean(live && live.id && live.view && live.status !== "running");
       if (keepLive) syncLiveAssistant(live);
@@ -1624,6 +1729,45 @@
     const form = $("#questionForm");
     const input = $("#questionInput");
     const examples = $("#exampleList");
+
+    const modeButtons = $$(".mode-option");
+    const setMode = (mode) => {
+      state.mode = mode === "research" ? "research" : "chat";
+      for (const btn of modeButtons) {
+        const active = btn.dataset.mode === state.mode;
+        btn.setAttribute("aria-checked", String(active));
+        btn.classList.toggle("is-active", active);
+        btn.tabIndex = active ? 0 : -1;
+      }
+      if (!state.streaming) {
+        const label = $("#sendLabel");
+        if (label) label.textContent = state.mode === "research" ? "开始研究" : "发送";
+      }
+      const note = $("#researchNote");
+      if (note) note.hidden = state.mode !== "research";
+    };
+    for (const btn of modeButtons) {
+      btn.addEventListener("click", () => setMode(btn.dataset.mode));
+    }
+    const modeGroup = $(".composer-modes");
+    if (modeGroup && modeButtons.length) {
+      modeGroup.addEventListener("keydown", (event) => {
+        if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+        event.preventDefault();
+        const focusedIndex = modeButtons.indexOf(document.activeElement);
+        const baseIndex = focusedIndex === -1
+          ? modeButtons.findIndex((btn) => btn.dataset.mode === state.mode)
+          : focusedIndex;
+        const step = event.key === "ArrowRight" ? 1 : -1;
+        const nextIndex = (baseIndex + step + modeButtons.length) % modeButtons.length;
+        const next = modeButtons[nextIndex];
+        if (next) {
+          setMode(next.dataset.mode);
+          next.focus();
+        }
+      });
+    }
+    setMode(state.mode);
 
     if (examples) {
       examples.addEventListener("click", (event) => {
