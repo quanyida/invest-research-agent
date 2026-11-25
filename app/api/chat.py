@@ -63,7 +63,7 @@ def _check_daily_quota(db: Any, user_id: uuid.UUID) -> None:
     if row is not None and row.questions >= 50:
         raise HTTPException(status_code=429, detail={"code": "DAILY_QUESTION_LIMIT", "message": "今日提问次数已达上限（50）"})
     if row is not None and row.tool_calls >= 400:
-        raise HTTPException(status_code=429, detail={"code": "DAILY_TOOL_LIMIT", "message": "今日工具调用次数已达上限（400）"})
+        raise HTTPException(status_code=429, detail={"code": "DAILY_LIMIT_REACHED", "message": "今日用量已达上限，请明天再试"})
 
 def _sse(event: str, data: dict[str, Any], event_id: int | None = None) -> str:
     payload = json.dumps(data, ensure_ascii=False, default=str, separators=(",", ":"))
