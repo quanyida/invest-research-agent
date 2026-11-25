@@ -24,6 +24,25 @@ def _load_dotenv(path: Path) -> None:
         os.environ.setdefault(key, value)
 
 
+def _sanitize_no_proxy() -> None:
+    """Drop bracketed IPv6 entries that crash httpx 0.27.2 with InvalidURL.
+
+    httpx parses ``NO_PROXY`` by splitting on commas; an entry like ``[::1]``
+    is read as a host with the port ``:1]`` and raises ``InvalidURL`` for every
+    outbound request. The bracketed form adds nothing over the bare ``::1``
+    entry, so strip only the redundant bracket copies.
+    """
+    for name in ("NO_PROXY", "no_proxy"):
+        raw = os.getenv(name)
+        if not raw:
+            continue
+        parts = [part.strip() for part in raw.split(",")]
+        kept = [part for part in parts if part and not (part.startswith("[") and part.endswith("]"))]
+        cleaned = ",".join(kept)
+        if cleaned != raw.strip():
+            os.environ[name] = cleaned
+
+
 def _int(name: str, default: int) -> int:
     try:
         return int(os.getenv(name, str(default)))
@@ -110,6 +129,7 @@ class Settings:
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     _load_dotenv(ROOT / ".env")
+    _sanitize_no_proxy()
     return Settings(
         app_env=os.getenv("APP_ENV", "dev"),
         app_secret=os.getenv("APP_SECRET", "dev-only-change-me"),
