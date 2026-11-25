@@ -244,6 +244,31 @@ def read_events(
         result.append({"id": int(row["id"]), "event": row["event"], "data": data or {}})
     return result
 
+def research_target(
+    tenant_id: uuid.UUID,
+    user_id: uuid.UUID,
+    run_id: uuid.UUID,
+) -> uuid.UUID | None:
+    """按 run_id 找到 research 任务的助手消息。
+
+    ``chat_runs`` 没有 RLS，必须显式带租户与用户过滤。
+    """
+    with session_scope() as db:
+        value = db.execute(
+            text(
+                "select message_id from chat_runs"
+                " where id = :id and tenant_id = :tenant_id and user_id = :user_id"
+            ),
+            {
+                "id": str(run_id),
+                "tenant_id": str(tenant_id),
+                "user_id": str(user_id),
+            },
+        ).scalar_one_or_none()
+    if value is None:
+        return None
+    return value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
+
 def run_status(tenant_id: uuid.UUID, run_id: uuid.UUID) -> str | None:
     with session_scope() as db:
         return db.execute(

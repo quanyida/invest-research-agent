@@ -4,7 +4,7 @@ import uuid
 
 from fastapi.testclient import TestClient
 
-from app.main import app
+from app.api_main import app
 
 def parse_sse(text: str):
     events = []

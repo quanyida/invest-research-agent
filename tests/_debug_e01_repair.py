@@ -4,7 +4,7 @@ import uuid
 from fastapi.testclient import TestClient
 
 import app.agent.loop as loop_module
-from app.main import app
+from app.api_main import app
 
 original_repair = loop_module.repair_citations
 original_verify = loop_module.verify_answer

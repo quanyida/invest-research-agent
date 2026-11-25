@@ -1,9 +1,9 @@
-﻿import json
+import json
 import uuid
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 
-from app.main import app
+from app.api_main import app
 from app.db import tenant_scope
 from app.models import Evidence, LlmCall, Message, ToolCall, UsageDaily
 

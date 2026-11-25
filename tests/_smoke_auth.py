@@ -1,6 +1,6 @@
 import uuid
 from fastapi.testclient import TestClient
-from app.main import app
+from app.api_main import app
 
 email = f"test-{uuid.uuid4().hex[:8]}@example.com"
 with TestClient(app) as c:

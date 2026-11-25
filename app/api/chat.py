@@ -7,6 +7,7 @@ import threading
 import time
 import uuid
 from collections import defaultdict, deque
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, AsyncIterator
 
@@ -86,132 +87,196 @@ def _busy_error() -> HTTPException:
         detail={"code": "CONVERSATION_BUSY", "message": "该会话上一条回答仍在生成，请稍候再问"},
     )
 
-@router.post("/chat")
-def chat(body: ChatBody, request: Request) -> StreamingResponse:
-    check_origin(request)
-    principal = require_principal(request)
+@dataclass(frozen=True)
+class PreparedTurn:
+    conversation_id: uuid.UUID
+    message_id: uuid.UUID
+    run_id: uuid.UUID
+    turn: int
+
+def _question_of(body: ChatBody) -> str:
     question = body.message.strip()
     if not question:
         raise HTTPException(status_code=400, detail={"code": "BAD_REQUEST", "message": "问题不能为空"})
-    _check_rate(principal.user_id)
+    return question
 
+def _prepare_turn(
+    db: Any,
+    principal: Any,
+    body: ChatBody,
+    question: str,
+    request_id: uuid.UUID,
+    message_id: uuid.UUID,
+) -> PreparedTurn:
+    """写 user/assistant 两条消息并入队；/chat 与 /research 共用。"""
+    _check_daily_quota(db, principal.user_id)
+
+    if body.client_request_id:
+        duplicated = db.scalar(
+            select(Message.id).where(
+                Message.user_id == principal.user_id,
+                Message.client_request_id == body.client_request_id,
+            ).limit(1)
+        )
+        if duplicated is not None:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "DUPLICATE_REQUEST", "message": "该请求已提交过，请刷新会话查看结果"},
+            )
+
+    if body.conversation_id is None:
+        conversation = Conversation(
+            id=uuid.uuid4(),
+            tenant_id=principal.tenant_id,
+            user_id=principal.user_id,
+            title=question[:36],
+        )
+        db.add(conversation)
+        db.flush()
+    else:
+        conversation = db.scalar(
+            select(Conversation).where(
+                Conversation.id == body.conversation_id,
+                Conversation.deleted_at.is_(None),
+            )
+        )
+        if conversation is None:
+            raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "会话不存在"})
+        if conversation.title in {"", "新会话"}:
+            conversation.title = question[:36]
+
+    assistant_count = db.scalar(
+        select(func.count(Message.id)).where(
+            Message.conversation_id == conversation.id,
+            Message.role == "assistant",
+        )
+    )
+    turn = int(assistant_count or 0) + 1
+
+    created_at = datetime.now(timezone.utc)
+    db.add(
+        Message(
+            id=uuid.uuid4(),
+            tenant_id=principal.tenant_id,
+            user_id=principal.user_id,
+            conversation_id=conversation.id,
+            request_id=request_id,
+            client_request_id=body.client_request_id,
+            role="user",
+            content=question,
+            status="done",
+            meta={},
+            created_at=created_at,
+        )
+    )
+    db.add(
+        Message(
+            id=message_id,
+            tenant_id=principal.tenant_id,
+            user_id=principal.user_id,
+            conversation_id=conversation.id,
+            request_id=request_id,
+            client_request_id=None,
+            role="assistant",
+            content="",
+            status="queued",
+            meta={},
+            created_at=created_at + timedelta(microseconds=1),
+        )
+    )
+    conversation.updated_at = created_at
+    db.flush()
+
+    run_id = run_queue.enqueue(
+        db,
+        tenant_id=principal.tenant_id,
+        user_id=principal.user_id,
+        conversation_id=conversation.id,
+        message_id=message_id,
+        request_id=request_id,
+    )
+    return PreparedTurn(
+        conversation_id=conversation.id,
+        message_id=message_id,
+        run_id=run_id,
+        turn=turn,
+    )
+
+def _start_turn(principal: Any, body: ChatBody, question: str) -> tuple[uuid.UUID, PreparedTurn]:
     request_id = uuid.uuid4()
     message_id = uuid.uuid4()
     try:
         with tenant_scope(principal.tenant_id, principal.user_id) as db:
-            _check_daily_quota(db, principal.user_id)
-
-            if body.client_request_id:
-                duplicated = db.scalar(
-                    select(Message.id).where(
-                        Message.user_id == principal.user_id,
-                        Message.client_request_id == body.client_request_id,
-                    ).limit(1)
-                )
-                if duplicated is not None:
-                    raise HTTPException(
-                        status_code=409,
-                        detail={"code": "DUPLICATE_REQUEST", "message": "该请求已提交过，请刷新会话查看结果"},
-                    )
-
-            if body.conversation_id is None:
-                conversation = Conversation(
-                    id=uuid.uuid4(),
-                    tenant_id=principal.tenant_id,
-                    user_id=principal.user_id,
-                    title=question[:36],
-                )
-                db.add(conversation)
-                db.flush()
-            else:
-                conversation = db.scalar(
-                    select(Conversation).where(
-                        Conversation.id == body.conversation_id,
-                        Conversation.deleted_at.is_(None),
-                    )
-                )
-                if conversation is None:
-                    raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "会话不存在"})
-                if conversation.title in {"", "新会话"}:
-                    conversation.title = question[:36]
-
-            assistant_count = db.scalar(
-                select(func.count(Message.id)).where(
-                    Message.conversation_id == conversation.id,
-                    Message.role == "assistant",
-                )
-            )
-            turn = int(assistant_count or 0) + 1
-
-            created_at = datetime.now(timezone.utc)
-            db.add(
-                Message(
-                    id=uuid.uuid4(),
-                    tenant_id=principal.tenant_id,
-                    user_id=principal.user_id,
-                    conversation_id=conversation.id,
-                    request_id=request_id,
-                    client_request_id=body.client_request_id,
-                    role="user",
-                    content=question,
-                    status="done",
-                    meta={},
-                    created_at=created_at,
-                )
-            )
-            db.add(
-                Message(
-                    id=message_id,
-                    tenant_id=principal.tenant_id,
-                    user_id=principal.user_id,
-                    conversation_id=conversation.id,
-                    request_id=request_id,
-                    client_request_id=None,
-                    role="assistant",
-                    content="",
-                    status="queued",
-                    meta={},
-                    created_at=created_at + timedelta(microseconds=1),
-                )
-            )
-            conversation.updated_at = created_at
-            db.flush()
-            conversation_id = conversation.id
-
-            try:
-                run_queue.enqueue(
-                    db,
-                    tenant_id=principal.tenant_id,
-                    user_id=principal.user_id,
-                    conversation_id=conversation_id,
-                    message_id=message_id,
-                    request_id=request_id,
-                )
-            except IntegrityError as exc:
-                if _is_conversation_busy(exc):
-                    raise _busy_error() from exc
-                raise
+            prepared = _prepare_turn(db, principal, body, question, request_id, message_id)
     except IntegrityError as exc:
         if _is_conversation_busy(exc):
             raise _busy_error() from exc
         raise HTTPException(status_code=409, detail={"code": "DUPLICATE_REQUEST", "message": "该请求已提交过"}) from exc
+    return request_id, prepared
+
+@router.post("/chat")
+def chat(body: ChatBody, request: Request) -> StreamingResponse:
+    check_origin(request)
+    principal = require_principal(request)
+    question = _question_of(body)
+    _check_rate(principal.user_id)
+
+    request_id, prepared = _start_turn(principal, body, question)
 
     settings = get_settings()
     meta = {
-        "conversation_id": str(conversation_id),
-        "message_id": str(message_id),
+        "conversation_id": str(prepared.conversation_id),
+        "message_id": str(prepared.message_id),
         "request_id": str(request_id),
         "timeout_seconds": settings.task_timeout_seconds,
         "engine": settings.agent_engine,
-        "turn": turn,
+        "turn": prepared.turn,
         "queued": True,
     }
     return StreamingResponse(
-        _stream_events(principal.tenant_id, principal.user_id, message_id, 0, initial=meta),
+        _stream_events(principal.tenant_id, principal.user_id, prepared.message_id, 0, initial=meta),
         media_type="text/event-stream",
         headers=_SSE_HEADERS,
     )
 
+@router.post("/research")
+def research(body: ChatBody, request: Request) -> dict[str, Any]:
+    """深度研究：写队列后立即返回 run_id，进度通过回放流获取。"""
+    check_origin(request)
+    principal = require_principal(request)
+    question = _question_of(body)
+    _check_rate(principal.user_id)
+
+    _, prepared = _start_turn(principal, body, question)
+    return {
+        "run_id": str(prepared.run_id),
+        "message_id": str(prepared.message_id),
+        "conversation_id": str(prepared.conversation_id),
+        "stream_url": f"/api/v1/research/{prepared.run_id}/stream",
+    }
+
+@router.get("/research/{run_id}/stream")
+def research_stream(run_id: uuid.UUID, request: Request, after: int = 0) -> StreamingResponse:
+    """回放 research 任务事件，支持 ?after 与 Last-Event-ID 续传。"""
+    check_origin(request)
+    principal = require_principal(request)
+    cursor = max(0, int(after))
+    last_event_id = request.headers.get("last-event-id")
+    if last_event_id:
+        try:
+            cursor = max(cursor, int(last_event_id))
+        except ValueError:
+            pass
+
+    message_id = run_queue.research_target(principal.tenant_id, principal.user_id, run_id)
+    if message_id is None:
+        raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "任务不存在"})
+
+    return StreamingResponse(
+        _stream_events(principal.tenant_id, principal.user_id, message_id, cursor),
+        media_type="text/event-stream",
+        headers=_SSE_HEADERS,
+    )
 @router.get("/messages/{message_id}/events")
 def message_events(message_id: uuid.UUID, request: Request, after: int = 0) -> StreamingResponse:
     """断线重连：从 cursor 之后回放事件，并继续跟随到结束。"""

@@ -254,7 +254,7 @@ def _verify(conninfo: dict, label: str = '[4/4] 校验') -> None:
 
 def _print_done() -> None:
     print('完成。可启动服务：')
-    print('  .\\.venv\\Scripts\\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000')
+    print('  .\\.venv\\Scripts\\python.exe -m uvicorn app.api_main:app --host 127.0.0.1 --port 8000')
 
 
 def main() -> int:

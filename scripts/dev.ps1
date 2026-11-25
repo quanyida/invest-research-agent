@@ -1,4 +1,4 @@
-﻿# 一键启动本地开发环境：依赖容器 -> Python 依赖 -> 数据库初始化 -> Web 服务
+# 一键启动本地开发环境：依赖容器 -> Python 依赖 -> 数据库初始化 -> Web 服务
 # 用法：.\scripts\dev.ps1
 # 可选：-SkipDocker（已有 PostgreSQL/Redis）、-SkipInstall（依赖已装好）、-Port 8080
 param(
@@ -53,4 +53,6 @@ if ($LASTEXITCODE -ne 0) { throw '数据库初始化失败。' }
 Write-Host ''
 Write-Host "服务地址：http://127.0.0.1:$Port/ui/"
 Write-Host '按 Ctrl+C 停止。'
-& $python -m uvicorn app.main:app --host 127.0.0.1 --port $Port
+# 单进程开发：Worker 跑在 API 进程内。生产用 api_main(8000) + agent_service_main(8001) 两个进程。
+$env:RUN_WORKER_ENABLED = 'true'
+& $python -m uvicorn app.api_main:app --host 127.0.0.1 --port $Port

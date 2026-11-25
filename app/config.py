@@ -175,7 +175,7 @@ def get_settings() -> Settings:
         history_turns=max(1, _int("HISTORY_TURNS", 3)),
         ifind_raw_passthrough=_bool("IFIND_RAW_PASSTHROUGH", True),
         tool_result_limit=_int("TOOL_RESULT_LIMIT", 32000),
-        run_worker_enabled=_bool("RUN_WORKER_ENABLED", True),
+        run_worker_enabled=_bool("RUN_WORKER_ENABLED", False),
         run_queue_poll_seconds=_float("RUN_QUEUE_POLL_SECONDS", 0.2),
         run_lease_seconds=_float("RUN_LEASE_SECONDS", 900.0),
         run_max_attempts=_int("RUN_MAX_ATTEMPTS", 2),

@@ -1,7 +1,7 @@
-﻿import json
+import json
 import uuid
 from fastapi.testclient import TestClient
-from app.main import app
+from app.api_main import app
 
 with TestClient(app) as client:
     email = f"debug-{uuid.uuid4().hex[:8]}@example.com"

@@ -46,7 +46,7 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 Copy-Item .env.example .env
 .\.venv\Scripts\python.exe scripts\bootstrap_db.py
-.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+.\.venv\Scripts\python.exe -m uvicorn app.api_main:app --host 127.0.0.1 --port 8000
 ```
 
 macOS / Linux：
@@ -58,7 +58,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
 python scripts/bootstrap_db.py
-uvicorn app.main:app --host 127.0.0.1 --port 8000
+uvicorn app.api_main:app --host 127.0.0.1 --port 8000
 ```
 
 ## 数据库初始化做了什么
@@ -68,7 +68,7 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
 1. 用管理员连接创建 `invest_auth`（NOLOGIN + BYPASSRLS，auth 函数所有者）和
    `invest_app`（登录角色，应用实际连接使用）；
 2. 创建数据库 `invest`（UTF8），所有者是 `invest_app`；
-3. 按文件名顺序执行 `infra/sql/001` ～ `007`；
+3. 按文件名顺序执行 `infra/sql/001` ～ `008`；
 4. 校验 RLS 已强制开启、`auth_*` 函数归 `invest_auth`、应用账号不能切换到该角色。
 
 默认连接参数与 `docker-compose.yml` 对齐：

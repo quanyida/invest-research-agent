@@ -1,3 +1,8 @@
+"""API 层入口（:8000）。
+
+只提供注册登录、会话 CRUD、用量查询与聊天转发；不执行 Agent。
+Agent 的执行逻辑在 ``app/agent_service_main.py``（:8001）。
+"""
 from __future__ import annotations
 
 import logging
@@ -13,7 +18,6 @@ from app.api.chat import router as chat_router
 from app.api.conversations import router as conversations_router
 from app.api.health import router as health_router
 from app.api.usage import router as usage_router
-from app.agent.run_worker import RunWorker
 from app.config import ROOT, get_settings
 
 logging.basicConfig(
@@ -24,8 +28,11 @@ logging.basicConfig(
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     settings = get_settings()
-    worker: RunWorker | None = None
+    worker = None
     if settings.run_worker_enabled:
+        # 延迟导入：API 层默认不依赖 Agent 执行栈，单进程开发时才加载。
+        from app.agent.run_worker import RunWorker
+
         worker = RunWorker(settings)
         await worker.start()
     try:

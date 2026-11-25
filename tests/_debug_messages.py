@@ -1,6 +1,6 @@
-﻿import json, uuid
+import json, uuid
 from fastapi.testclient import TestClient
-from app.main import app
+from app.api_main import app
 with TestClient(app) as c:
     e = "chat-" + uuid.uuid4().hex[:8] + "@example.com"
     c.post("/api/v1/auth/register", json={"email": e, "password": "test-pass-123", "tenant_name": "x"})
