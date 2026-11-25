@@ -253,7 +253,247 @@
     setText($("#agentStatus"), value);
   }
 
-  function createMessageRow(message) {
+  const TOOL_PROGRESS_LABELS = {
+    "ifind.stock_quote": "iFinD 行情",
+    "ifind.stock_summary": "iFinD 概况",
+    "ifind.stock_financials": "iFinD 财报",
+    "ifind.stock_performance": "iFinD 行情",
+    "ifind.stock_holders": "iFinD 股东",
+    "ifind.stock_events": "iFinD 事件",
+    "ifind.stock_risk": "iFinD 风险",
+    "ifind.notice_search": "iFinD 公告",
+    "ifind.news_search": "iFinD 资讯",
+    "ifind.macro": "iFinD 宏观",
+    "ifind.index": "iFinD 指数",
+    "ifind.screen": "iFinD 选股",
+    "ifind.global_profile": "iFinD 概况",
+    "ifind.global_quotes": "iFinD 行情",
+    "ifind.global_financials": "iFinD 财报",
+    "ifind.global_events": "iFinD 事件",
+    "ifind.global_screen": "iFinD 选股",
+    "web.search": "网页搜索",
+  };
+
+  function progressLabelForTool(tool) {
+    const key = String(tool || "").trim();
+    return TOOL_PROGRESS_LABELS[key] || key || "工具";
+  }
+
+  function clearRunProgressTimers(progress) {
+    if (!progress) return;
+    for (const timer of progress.timers || []) window.clearTimeout(timer);
+    progress.timers = [];
+  }
+
+  function updateRunProgressSummary(progress) {
+    if (!progress) return;
+    const total = progress.steps.length;
+    const failed = progress.steps.filter((step) => step.status === "failed").length;
+    const running = progress.steps.some((step) => step.status === "running");
+    let text;
+    if (!total) {
+      text = progress.finished ? "已结束" : "准备中";
+    } else if (progress.finished) {
+      if (progress.finalStatus === "error" || progress.finalStatus === "cancelled") text = total + " 步 · 已中断";
+      else text = total + " 步" + (failed ? " · " + failed + " 步失败" : " · 已完成");
+    } else {
+      const parts = [total + " 步"];
+      if (running) parts.push("进行中");
+      if (failed) parts.push(failed + " 步失败");
+      text = parts.join(" · ");
+    }
+    setText(progress.meta, text);
+  }
+
+  function createRunProgress() {
+    const details = document.createElement("details");
+    details.className = "run-progress";
+    details.open = true;
+    const summary = document.createElement("summary");
+    summary.className = "run-progress-summary";
+    const title = document.createElement("span");
+    title.className = "run-progress-title";
+    title.textContent = "执行过程";
+    const meta = document.createElement("span");
+    meta.className = "run-progress-meta";
+    summary.append(title, meta);
+    const body = document.createElement("div");
+    body.className = "run-progress-body";
+    const empty = document.createElement("div");
+    empty.className = "run-progress-empty";
+    empty.textContent = "Agent 正在分析并选择工具…";
+    body.appendChild(empty);
+    const hint = document.createElement("div");
+    hint.className = "run-progress-hint";
+    hint.hidden = true;
+    details.append(summary, body, hint);
+    const progress = {
+      details,
+      meta,
+      body,
+      empty,
+      hint,
+      steps: [],
+      phase: null,
+      finished: false,
+      finalStatus: "",
+      timers: [],
+    };
+    progress.timers.push(
+      window.setTimeout(() => {
+        if (progress.finished || !progress.details.isConnected) return;
+        hint.textContent = "本次分析较复杂，仍在进行中…";
+        hint.hidden = false;
+      }, 30000)
+    );
+    progress.timers.push(
+      window.setTimeout(() => {
+        if (progress.finished || !progress.details.isConnected) return;
+        hint.textContent = "深度分析需要较长时间，请稍候…";
+        hint.hidden = false;
+      }, 60000)
+    );
+    updateRunProgressSummary(progress);
+    return progress;
+  }
+
+  function appendRunProgressStep(progress, tool) {
+    const label = progressLabelForTool(tool);
+    const row = document.createElement("div");
+    row.className = "run-step";
+    row.dataset.state = "running";
+    row.dataset.tool = String(tool || "");
+    const mark = document.createElement("span");
+    mark.className = "run-step-mark";
+    mark.textContent = "…";
+    const copy = document.createElement("span");
+    copy.className = "run-step-copy";
+    copy.textContent = "正在取数 · " + label;
+    const time = document.createElement("span");
+    time.className = "run-step-time";
+    row.append(mark, copy, time);
+    progress.body.appendChild(row);
+    const step = {
+      tool: String(tool || ""),
+      label,
+      status: "running",
+      row,
+      mark,
+      copy,
+      time,
+    };
+    progress.steps.push(step);
+    if (progress.empty) {
+      progress.empty.remove();
+      progress.empty = null;
+    }
+    updateRunProgressSummary(progress);
+    return step;
+  }
+
+  function startRunProgressStep(current, data) {
+    const progress = current && current.view && current.view.progress;
+    if (!progress || progress.finished) return;
+    if (progress.phase) {
+      progress.phase.remove();
+      progress.phase = null;
+    }
+    appendRunProgressStep(progress, data && data.tool);
+  }
+
+  function finishRunProgressStep(current, data) {
+    const progress = current && current.view && current.view.progress;
+    if (!progress || progress.finished) return;
+    const tool = String((data && data.tool) || "");
+    let step = null;
+    for (let index = progress.steps.length - 1; index >= 0; index -= 1) {
+      const item = progress.steps[index];
+      if (item.status === "running" && item.tool === tool) {
+        step = item;
+        break;
+      }
+    }
+    if (!step) step = appendRunProgressStep(progress, tool);
+    const ok = data && data.status === "ok";
+    step.status = ok ? "ok" : "failed";
+    step.row.dataset.state = step.status;
+    step.mark.textContent = ok ? "✓" : "!";
+    step.copy.textContent = (ok ? "已取回" : "取数失败") + " · " + step.label;
+    const parts = [formatMs(data && data.latency_ms)];
+    if (data && data.cached) parts.push("缓存");
+    if (!ok && data && data.error_code) parts.push(String(data.error_code));
+    step.time.textContent = parts.filter(Boolean).join(" · ");
+    updateRunProgressSummary(progress);
+  }
+
+  function setRunProgressPhase(current, text) {
+    const progress = current && current.view && current.view.progress;
+    if (!progress || progress.finished) return;
+    if (progress.phase) {
+      progress.phase.textContent = text;
+      return;
+    }
+    const phase = document.createElement("div");
+    phase.className = "run-progress-phase";
+    phase.textContent = text;
+    progress.body.appendChild(phase);
+    progress.phase = phase;
+  }
+
+  function finishRunProgress(current, status) {
+    const progress = current && current.view && current.view.progress;
+    if (!progress || progress.finished) return;
+    progress.finished = true;
+    progress.finalStatus = status || "";
+    clearRunProgressTimers(progress);
+    progress.hint.hidden = true;
+    if (progress.phase) {
+      progress.phase.remove();
+      progress.phase = null;
+    }
+    for (const step of progress.steps) {
+      if (step.status !== "running") continue;
+      step.status = "failed";
+      step.row.dataset.state = "failed";
+      step.mark.textContent = "!";
+      step.copy.textContent = "未返回结果 · " + step.label;
+      step.time.textContent = "—";
+    }
+    if (!progress.steps.length) {
+      progress.details.remove();
+      return;
+    }
+    progress.details.open = false;
+    progress.details.classList.add("is-complete");
+    updateRunProgressSummary(progress);
+  }
+
+  function resetRunProgress(current) {
+    const old = current && current.view && current.view.progress;
+    if (old) {
+      clearRunProgressTimers(old);
+      old.details.remove();
+    }
+    if (!current || !current.view || !current.view.body || !current.view.textNode) return;
+    const progress = createRunProgress();
+    current.view.progress = progress;
+    current.view.body.insertBefore(progress.details, current.view.textNode);
+  }
+
+  function syncLiveAssistant(current) {
+    if (!current) return;
+    const last = state.messages[state.messages.length - 1];
+    if (!last || last.role !== "assistant") return;
+    if (current.id) last.id = current.id;
+    last.content = current.content || "";
+    last.status = current.status || last.status;
+    last.evidence = Array.isArray(current.evidence) ? current.evidence.slice() : [];
+    last.meta = { ...(current.meta || {}) };
+    const turn = current.view && current.view.row ? Number(current.view.row.dataset.turn) : null;
+    if (Number.isInteger(turn) && turn > 0) last.turn = turn;
+  }
+
+  function createMessageRow(message, options = {}) {
     const row = document.createElement("article");
     row.className = "message " + (message.role === "assistant" ? "assistant" : "user");
     if (message.id) row.dataset.messageId = message.id;
@@ -286,6 +526,11 @@
 
     const body = document.createElement("div");
     body.className = "message-body";
+    let progress = null;
+    if (message.role === "assistant" && options.live) {
+      progress = createRunProgress();
+      body.appendChild(progress.details);
+    }
     let textNode = null;
     if (message.role === "assistant") {
       textNode = document.createElement("div");
@@ -304,7 +549,7 @@
     }
 
     row.append(meta, body);
-    const view = { row, textNode, statusLabelNode, statusDotNode, body };
+    const view = { row, textNode, statusLabelNode, statusDotNode, body, progress };
     renderVerifyLine(view, message);
     return view;
   }
@@ -354,9 +599,9 @@
     }
   }
 
-  function appendMessage(message) {
+  function appendMessage(message, options = {}) {
     const messages = $("#messages");
-    const view = createMessageRow(message);
+    const view = createMessageRow(message, options);
     if (messages) messages.appendChild(view.row);
     const empty = $("#emptyState");
     if (empty) empty.hidden = true;
@@ -384,13 +629,21 @@
     { key: "pending", label: "边界", marker: "边界：" },
   ];
 
+  function sectionRegex(label) {
+    const escaped = String(label).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(
+      "^[ \\t]*(?:#{1,6}[ \\t]*)?(?:\\*\\*)?(?:" + escaped + ")(?:\\*\\*)?[ \\t]*(?:[:：][ \\t]*(?:\\*\\*)?|$)",
+      "m",
+    );
+  }
+
   function collectSections(raw, definitions) {
     const found = [];
     for (const section of definitions) {
-      const index = raw.indexOf(section.marker);
-      if (index >= 0) found.push({ ...section, index, start: index + section.marker.length });
+      const match = sectionRegex(section.label).exec(raw);
+      if (!match) return null;
+      found.push({ ...section, index: match.index, start: match.index + match[0].length });
     }
-    if (found.length !== definitions.length) return null;
     found.sort((left, right) => left.index - right.index);
     if (found.map((item) => item.key).join(",") !== definitions.map((item) => item.key).join(",")) {
       return null;
@@ -403,13 +656,15 @@
     return sections;
   }
 
+  // Legacy-friendly path. Answers that still carry the old four-section
+  // headings render as sections; mostly historical messages. New answers
+  // usually have no headings and fall through to the Markdown renderer.
   function parseAnswerSections(text) {
     const raw = String(text || "");
     return collectSections(raw, ANSWER_SECTIONS) || collectSections(raw, LEGACY_SECTIONS);
   }
 
   const SUBHEAD_RE = /^[\u4e00-\u9fa5A-Za-z0-9（）()·“”\- ]{2,24}：$/;
-  const LIST_RE = /^\s*(?:\d{1,2}[.、)）](?!\d)|[（(]\d{1,2}[）)]|[一二三四五六七八九十]+、)\s*/;
 
   function channelInfo(evidence) {
     const key = String((evidence && evidence.channel) || "").toLowerCase();
@@ -606,92 +861,230 @@
     node.appendChild(pill);
   }
 
-  function appendCitedText(node, text, citationIndex) {
+  function extractCitations(text, citationIndex) {
     const raw = String(text || "");
     const index = citationIndex || new Map();
-    const blockPattern = /[\[（(]E\d+-\d+[\]）)](?:[ \t]*[，,、;；]?[ \t]*[\[（(]E\d+-\d+[\]）)])*/g;
-    let last = 0;
-    let block = blockPattern.exec(raw);
-    while (block) {
-      if (block.index > last) node.appendChild(document.createTextNode(raw.slice(last, block.index)));
-      const blockText = block[0];
-      const tokenPattern = /[\[（(](E\d+-\d+)[\]）)]/g;
-      const ids = [];
-      const sources = new Map();
-      let token = tokenPattern.exec(blockText);
-      while (token) {
-        const id = token[1];
-        if (!ids.includes(id)) ids.push(id);
+    const tokenPattern = /[\[（(](E\d+-\d+)[\]）)]/g;
+    const blockPattern = /[\[（(]E\d+-\d+[\]）)](?:[ \t]*[，,、;；]?[ \t]*(?:以及|和|与)?[ \t]*[\[（(]E\d+-\d+[\]）)])*/g;
+    const seen = new Set();
+    const sources = new Map();
+    let token = tokenPattern.exec(raw);
+    while (token) {
+      const id = token[1];
+      if (!seen.has(id)) {
+        seen.add(id);
         const source = sourceInfoOf(index.get(id), id);
-        if (!sources.has(source.key)) sources.set(source.key, { source, ids: [], raws: [] });
+        if (!sources.has(source.key)) {
+          sources.set(source.key, { source, ids: [], raws: [] });
+        }
         const group = sources.get(source.key);
         group.ids.push(id);
         group.raws.push(token[0]);
-        token = tokenPattern.exec(blockText);
       }
-      for (const group of sources.values()) {
-        appendCitationPill(node, group.raws.join(""), group.ids, group.source);
-      }
-      last = block.index + blockText.length;
-      block = blockPattern.exec(raw);
+      token = tokenPattern.exec(raw);
     }
-    if (last < raw.length) node.appendChild(document.createTextNode(raw.slice(last)));
+    let textOnly = raw.replace(blockPattern, "");
+    if (seen.size) {
+      textOnly = textOnly.replace(/[ \t]+([，,。；;：:！？!?、])/g, "$1");
+      textOnly = textOnly.replace(/[ \t]{2,}/g, " ");
+      textOnly = textOnly.trim();
+    }
+    return { text: textOnly, groups: Array.from(sources.values()) };
   }
 
-  function appendBody(container, text, citationIndex) {
-    const normalized = String(text || "").replace(
-      /([。；;！？!?])\s*(?=(?:\d{1,2}[.、)）](?!\d)|[（(]\d{1,2}[）)]|[一二三四五六七八九十]+、)\s*)/g,
-      "$1\n",
-    );
+  function appendCitationPills(node, groups) {
+    if (!groups || !groups.length) return;
+    const wrap = document.createElement("span");
+    wrap.className = "answer-citations";
+    for (const group of groups) {
+      appendCitationPill(wrap, group.raws.join(""), group.ids, group.source);
+    }
+    node.appendChild(wrap);
+  }
+
+  const MD_UL_RE = /^\s*[-*+]\s+/;
+  const MD_OL_RE = /^\s*([0-9]{1,2})[.)]\s+/;
+  const LEGACY_LIST_RE = /^\s*(?:[0-9]{1,2}、|(?:[（(][0-9]{1,2}[）)]|[一二三四五六七八九十]+、))\s*/;
+  const FENCE_RE = /^\s*```/;
+
+  function appendInlineMarkdown(node, text) {
+    const value = String(text || "");
+    const pattern = /`([^`\n]*)`|\*\*([^*\n]*)\*\*|\*([^*\n]*)\*/g;
+    let last = 0;
+    let match = pattern.exec(value);
+    while (match) {
+      if (match.index > last) {
+        node.appendChild(document.createTextNode(value.slice(last, match.index)));
+      }
+      if (match[1] !== undefined) {
+        const code = document.createElement("code");
+        code.className = "answer-code";
+        code.textContent = match[1];
+        node.appendChild(code);
+      } else if (match[2] !== undefined) {
+        const strong = document.createElement("strong");
+        strong.textContent = match[2];
+        node.appendChild(strong);
+      } else {
+        const em = document.createElement("em");
+        em.textContent = match[3];
+        node.appendChild(em);
+      }
+      last = match.index + match[0].length;
+      match = pattern.exec(value);
+    }
+    if (last < value.length) {
+      node.appendChild(document.createTextNode(value.slice(last)));
+    }
+  }
+
+  function appendCitedText(node, text, citationIndex) {
+    const extracted = extractCitations(text, citationIndex);
+    if (extracted.text) appendInlineMarkdown(node, extracted.text);
+    appendCitationPills(node, extracted.groups);
+  }
+
+  function appendPlainCitedText(node, text, citationIndex) {
+    const extracted = extractCitations(text, citationIndex);
+    if (extracted.text) node.appendChild(document.createTextNode(extracted.text));
+    appendCitationPills(node, extracted.groups);
+  }
+
+  function parseMarkdownBlocks(text) {
+    const normalized = String(text || "")
+      .replace(/\r\n?/g, "\n")
+      .replace(
+        /([。；;！？!?])\s*(?=(?:[0-9]{1,2}[.、)）](?![0-9])|[（(][0-9]{1,2}[）)]|[一二三四五六七八九十]+、)\s*)/g,
+        "$1\n",
+      );
     const lines = normalized.split("\n");
-    let paragraph = [];
-    const flush = () => {
-      const joined = paragraph.join("\n").trim();
-      if (!joined) return;
-      const node = document.createElement("p");
-      node.className = "answer-paragraph";
-      appendCitedText(node, joined, citationIndex);
-      container.appendChild(node);
-      paragraph = [];
-    };
-    for (const line of lines) {
+    const blocks = [];
+    let index = 0;
+    while (index < lines.length) {
+      const line = lines[index];
       const trimmed = line.trim();
-      if (!trimmed) { flush(); continue; }
-      if (LIST_RE.test(trimmed)) {
-        flush();
-        const item = document.createElement("p");
-        item.className = "answer-paragraph answer-list-item";
-        appendCitedText(item, trimmed, citationIndex);
-        container.appendChild(item);
+      if (!trimmed) {
+        index += 1;
+        continue;
+      }
+      if (FENCE_RE.test(line)) {
+        index += 1;
+        const plain = [];
+        while (index < lines.length && !FENCE_RE.test(lines[index])) {
+          if (lines[index].trim()) plain.push(lines[index].trim());
+          index += 1;
+        }
+        if (index < lines.length) index += 1;
+        if (plain.length) blocks.push({ type: "plain", text: plain.join("\n") });
+        continue;
+      }
+      const heading = /^(#{1,6})\s+(.*)$/.exec(trimmed);
+      if (heading) {
+        blocks.push({ type: "heading", text: heading[2].trim() });
+        index += 1;
+        continue;
+      }
+      if (/^>\s?/.test(trimmed)) {
+        const quotes = [];
+        while (index < lines.length && /^\s*>\s?/.test(lines[index])) {
+          const quoted = lines[index].replace(/^\s*>\s?/, "").trim();
+          if (quoted) quotes.push(quoted);
+          index += 1;
+        }
+        if (quotes.length) blocks.push({ type: "quote", lines: quotes });
+        continue;
+      }
+      if (MD_UL_RE.test(line)) {
+        const items = [];
+        while (index < lines.length && MD_UL_RE.test(lines[index])) {
+          items.push(lines[index].replace(MD_UL_RE, "").trim());
+          index += 1;
+        }
+        blocks.push({ type: "ul", items });
+        continue;
+      }
+      if (MD_OL_RE.test(line)) {
+        const startMatch = MD_OL_RE.exec(line);
+        const start = Number(startMatch[1]) || 1;
+        const items = [];
+        while (index < lines.length) {
+          const match = MD_OL_RE.exec(lines[index]);
+          if (!match) break;
+          items.push(lines[index].replace(MD_OL_RE, "").trim());
+          index += 1;
+        }
+        blocks.push({ type: "ol", start, items });
+        continue;
+      }
+      if (LEGACY_LIST_RE.test(trimmed)) {
+        blocks.push({ type: "legacy-item", text: trimmed });
+        index += 1;
         continue;
       }
       if (SUBHEAD_RE.test(trimmed)) {
-        flush();
+        blocks.push({ type: "heading", text: trimmed.replace(/：$/, "") });
+        index += 1;
+        continue;
+      }
+      const paragraph = [];
+      while (index < lines.length) {
+        const current = lines[index];
+        const currentTrimmed = current.trim();
+        if (!currentTrimmed) break;
+        if (FENCE_RE.test(current)) break;
+        if (/^(#{1,6})\s+/.test(currentTrimmed)) break;
+        if (/^>\s?/.test(currentTrimmed)) break;
+        if (MD_UL_RE.test(current) || MD_OL_RE.test(current)) break;
+        if (LEGACY_LIST_RE.test(currentTrimmed)) break;
+        if (SUBHEAD_RE.test(currentTrimmed)) break;
+        paragraph.push(currentTrimmed);
+        index += 1;
+      }
+      blocks.push({ type: "paragraph", text: paragraph.join("\n") });
+    }
+    return blocks;
+  }
+
+  function appendMarkdown(container, text, citationIndex) {
+    for (const block of parseMarkdownBlocks(text)) {
+      if (block.type === "ul" || block.type === "ol") {
+        const list = document.createElement(block.type === "ul" ? "ul" : "ol");
+        list.className = "answer-list";
+        if (block.type === "ol" && block.start > 1) list.start = block.start;
+        for (const itemText of block.items) {
+          const item = document.createElement("li");
+          appendCitedText(item, itemText, citationIndex);
+          list.appendChild(item);
+        }
+        container.appendChild(list);
+        continue;
+      }
+      if (block.type === "quote") {
+        const quote = document.createElement("blockquote");
+        quote.className = "answer-quote";
+        for (const quoteText of block.lines) {
+          const para = document.createElement("p");
+          para.className = "answer-paragraph";
+          appendCitedText(para, quoteText, citationIndex);
+          quote.appendChild(para);
+        }
+        container.appendChild(quote);
+        continue;
+      }
+      if (block.type === "heading") {
         const head = document.createElement("h4");
         head.className = "answer-subhead";
-        head.textContent = trimmed.replace(/：$/, "");
+        appendCitedText(head, block.text, citationIndex);
         container.appendChild(head);
         continue;
       }
-      paragraph.push(trimmed);
-    }
-    flush();
-    if (!container.querySelector(".answer-paragraph, .answer-subhead")) {
-      const node = document.createElement("p");
-      node.className = "answer-paragraph";
-      appendCitedText(node, String(text || "").trim(), citationIndex);
-      container.appendChild(node);
-    }
-  }
-
-  function appendLines(container, text, citationIndex) {
-    for (const line of String(text || "").split("\n")) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      const node = document.createElement("p");
-      node.className = "answer-paragraph";
-      appendCitedText(node, trimmed, citationIndex);
-      container.appendChild(node);
+      const para = document.createElement("p");
+      para.className = block.type === "legacy-item"
+        ? "answer-paragraph answer-list-item"
+        : "answer-paragraph";
+      if (block.type === "plain") appendPlainCitedText(para, block.text, citationIndex);
+      else appendCitedText(para, block.text, citationIndex);
+      container.appendChild(para);
     }
   }
 
@@ -704,10 +1097,7 @@
     const sections = parseAnswerSections(text);
     const citationIndex = buildCitationIndex(evidences);
     if (!sections) {
-      const node = document.createElement("p");
-      node.className = "answer-paragraph";
-      appendCitedText(node, text, citationIndex);
-      textNode.appendChild(node);
+      appendMarkdown(textNode, text, citationIndex);
       return;
     }
     for (const section of ANSWER_SECTIONS) {
@@ -718,8 +1108,7 @@
       label.textContent = section.label;
       block.appendChild(label);
       const value = sections[section.key];
-      if (section.key === "conclusion" || section.key === "evidence") appendBody(block, value, citationIndex);
-      else appendLines(block, value, citationIndex);
+      appendMarkdown(block, value, citationIndex);
       textNode.appendChild(block);
     }
   }
@@ -1051,7 +1440,7 @@
     };
     state.messages.push(userMessage, assistant);
     appendMessage(userMessage);
-    const view = appendMessage(assistant);
+    const view = appendMessage(assistant, { live: true });
     state.currentAssistant = { ...assistant, view };
     setAgentStatus("Agent 正在分析并选择工具…");
     scrollBottom();
@@ -1065,7 +1454,10 @@
           state.activeId = data.conversation_id;
           renderConversationList();
         }
-        if (data.message_id) current.id = data.message_id;
+        if (data.message_id) {
+          current.id = data.message_id;
+          if (current.view && current.view.row) current.view.row.dataset.messageId = data.message_id;
+        }
         current.meta = { ...(current.meta || {}), ...data };
         if (Number(data.attempt) > 1) {
           current.content = "";
@@ -1081,6 +1473,7 @@
             current.view.textNode.classList.add("answer-empty");
             current.view.textNode.classList.remove("answer-text");
           }
+          resetRunProgress(current);
           setAgentStatus("正在重试…");
         }
         return;
@@ -1096,12 +1489,14 @@
         return;
       }
       if (eventName === "tool_start") {
-        setAgentStatus("正在取数 · " + (data.tool || "工具"));
+        startRunProgressStep(current, data);
+        setAgentStatus("正在取数 · " + progressLabelForTool(data.tool));
         return;
       }
       if (eventName === "tool_end") {
         const ok = data.status === "ok";
-        setAgentStatus((ok ? "已取回" : "取数失败") + " · " + (data.tool || "工具") + " · " + formatMs(data.latency_ms));
+        finishRunProgressStep(current, data);
+        setAgentStatus((ok ? "已取回" : "取数失败") + " · " + progressLabelForTool(data.tool) + " · " + formatMs(data.latency_ms));
         return;
       }
       if (eventName === "evidence") {
@@ -1110,11 +1505,13 @@
         return;
       }
       if (eventName === "delta") {
+        setRunProgressPhase(current, "正在组织答案…");
         if (data && typeof data.text === "string") appendDelta(current, data.text);
         return;
       }
       if (eventName === "verify") {
         current.meta = { ...(current.meta || {}), verify: data };
+        setRunProgressPhase(current, "正在核对引用…");
         const label =
           data.removed_citations > 0
             ? "部分引用无法核实 · 已移除 " + data.removed_citations + " 条"
@@ -1132,12 +1529,14 @@
         renderAnswer(view.textNode, current.content, current.evidence, current.meta);
         refreshLiveCounts(current);
         renderVerifyLine(view, current);
+        finishRunProgress(current, current.status);
         setRowStatus(view, current.status, statusInfo(current.status, current.meta).label);
         setAgentStatus("完成 · " + statusInfo(current.status, current.meta).label);
         return;
       }
       if (eventName === "error") {
         current.status = "error";
+        finishRunProgress(current, "error");
         setRowStatus(view, "error");
         showError((data && data.message) || "回答失败");
         setAgentStatus("回答失败");
@@ -1172,6 +1571,7 @@
       }
       if (state.currentAssistant && state.currentAssistant.status === "running") {
         state.currentAssistant.status = "error";
+        finishRunProgress(state.currentAssistant, "error");
         setRowStatus(view, "error");
         showError("连接恢复失败，请刷新会话查看结果。");
         setAgentStatus("连接中断");
@@ -1187,15 +1587,19 @@
       }
       if (!recovered) {
         state.currentAssistant.status = "error";
+        finishRunProgress(state.currentAssistant, "error");
         setRowStatus(view, "error");
         showError(error.message || "提问失败");
         setAgentStatus("请求失败");
       }
     } finally {
+      const live = state.currentAssistant;
+      const keepLive = Boolean(live && live.id && live.view && live.status !== "running");
+      if (keepLive) syncLiveAssistant(live);
       setBusy(false);
       try {
         await loadConversations();
-        if (state.activeId) await openConversation(state.activeId);
+        if (state.activeId && !keepLive) await openConversation(state.activeId);
       } catch (error) {
         showError(error.message);
       }
@@ -1270,7 +1674,6 @@
     try {
       const data = await api("/api/v1/usage?days=7");
       const today = data.today || {};
-      setText($("#todayQuestions"), formatNumber(today.questions || 0));
       setText($("#todayTools"), formatNumber(today.tool_calls || 0));
       setText($("#todayTokens"), formatNumber((today.prompt_tokens || 0) + (today.completion_tokens || 0)));
       setText($("#todayModels"), formatNumber(today.llm_calls || 0));
@@ -1317,12 +1720,7 @@
       if (limitList) {
         limitList.replaceChildren();
         const pairs = [
-          ["每日提问", formatNumber(limits.questions_per_day) + " 次"],
-          ["每日工具调用", formatNumber(limits.tool_calls_per_day) + " 次"],
-          ["每分钟请求", formatNumber(limits.requests_per_minute) + " 次"],
-          ["单次任务超时", formatNumber(limits.task_timeout_seconds) + " 秒"],
-          ["单次最多工具", limits.max_tool_calls_per_question == null ? "不设上限" : formatNumber(limits.max_tool_calls_per_question) + " 次"],
-          ["单次模型尝试", formatNumber(limits.model_max_attempts) + " 次"],
+          ["每日提问", formatNumber(today.questions || 0) + " / " + formatNumber(limits.questions_per_day) + " 次"],
         ];
         for (const pair of pairs) {
           const item = document.createElement("div");
