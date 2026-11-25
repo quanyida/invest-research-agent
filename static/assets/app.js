@@ -206,6 +206,15 @@
     setText($("#pageSub"), subtitle || "用自然语言提问，得到带证据编号的答案。");
   }
 
+  const CONVERSATION_STATUS = {
+    running: { label: "运行中", tone: "running" },
+    queued: { label: "排队中", tone: "running" },
+    done: { label: "完成", tone: "done" },
+    degraded: { label: "部分完成", tone: "warn" },
+    failed: { label: "失败", tone: "fail" },
+    error: { label: "失败", tone: "fail" },
+  };
+
   function renderConversationList() {
     const list = $("#conversationList");
     if (!list) return;
@@ -222,13 +231,40 @@
       button.type = "button";
       button.className = "conversation-item" + (item.id === state.activeId ? " active" : "");
       button.dataset.id = item.id;
+
+      const head = document.createElement("span");
+      head.className = "conversation-head";
       const title = document.createElement("span");
       title.className = "conversation-title";
       title.textContent = item.title || "未命名会话";
+      head.appendChild(title);
+
+      const last = item.last_message || null;
+      const statusInfo = last ? CONVERSATION_STATUS[last.status] : null;
+      if (statusInfo) {
+        const badge = document.createElement("span");
+        badge.className = "conversation-status";
+        badge.dataset.tone = statusInfo.tone;
+        badge.textContent = statusInfo.label;
+        head.appendChild(badge);
+      }
+
+      const nodes = [head];
+      const preview = last && last.preview ? String(last.preview).replace(/\s+/g, " ").trim() : "";
+      if (preview) {
+        const previewNode = document.createElement("span");
+        previewNode.className = "conversation-preview";
+        previewNode.textContent = preview;
+        nodes.push(previewNode);
+      }
+
       const date = document.createElement("span");
       date.className = "conversation-date";
-      date.textContent = formatTime(item.updated_at || item.created_at);
-      button.append(title, date);
+      const total = Number(item.message_count || 0);
+      date.textContent = (total ? total + " 条 · " : "") + formatTime(item.updated_at || item.created_at);
+      nodes.push(date);
+
+      button.append(...nodes);
       button.addEventListener("click", () => {
         if (!state.streaming) openConversation(item.id);
       });
@@ -1358,6 +1394,122 @@
     if (input) input.focus();
   }
 
+  function applyAgentEvent(eventName, data) {
+    const current = state.currentAssistant;
+    if (!current) return;
+    const view = current.view;
+    if (eventName === "meta") {
+      if (data.conversation_id && !state.activeId) {
+        state.activeId = data.conversation_id;
+        renderConversationList();
+      }
+      if (data.message_id) {
+        current.id = data.message_id;
+        if (view && view.row) view.row.dataset.messageId = data.message_id;
+      }
+      current.meta = { ...(current.meta || {}), ...data };
+      if (Number(data.attempt) > 1) {
+        current.content = "";
+        current.evidence = [];
+        if (state.liveTurn) {
+          state.evidenceTurns = state.evidenceTurns.filter((item) => item.turn !== state.liveTurn);
+          delete state.openTurns[state.liveTurn];
+          state.liveTurn = null;
+        }
+        renderEvidencePanel();
+        if (view) {
+          view.textNode.textContent = "";
+          view.textNode.classList.add("answer-empty");
+          view.textNode.classList.remove("answer-text");
+        }
+        resetRunProgress(current);
+        setAgentStatus("正在重试…");
+      }
+      return;
+    }
+    if (eventName === "plan") {
+      if (data.mode === "agentscope_auto") {
+        const allowed = Array.isArray(data.allowed) ? data.allowed.length : 0;
+        setAgentStatus("Agent 自主选择工具" + (allowed ? " · 可用 " + allowed + " 个" : ""));
+      } else {
+        const tools = Array.isArray(data.tools) ? data.tools.map((item) => item.name).join("、") : "";
+        setAgentStatus("已规划 · " + (data.intent || "unknown") + (tools ? " · " + tools : ""));
+      }
+      return;
+    }
+    if (eventName === "tool_start") {
+      startRunProgressStep(current, data);
+      setAgentStatus("正在取数 · " + progressLabelForTool(data.tool));
+      return;
+    }
+    if (eventName === "tool_end") {
+      const ok = data.status === "ok";
+      finishRunProgressStep(current, data);
+      setAgentStatus((ok ? "已取回" : "取数失败") + " · " + progressLabelForTool(data.tool) + " · " + formatMs(data.latency_ms));
+      return;
+    }
+    if (eventName === "evidence") {
+      const evidence = data && data.evidence;
+      if (evidence) registerLiveEvidence(current, evidence);
+      return;
+    }
+    if (eventName === "delta") {
+      setRunProgressPhase(current, "正在组织答案…");
+      if (data && typeof data.text === "string") appendDelta(current, data.text);
+      return;
+    }
+    if (eventName === "delta_reset") {
+      current.content = "";
+      if (view) {
+        view.textNode.textContent = "";
+        view.textNode.classList.add("answer-empty");
+        view.textNode.classList.remove("answer-text");
+      }
+      return;
+    }
+    if (eventName === "verify") {
+      current.meta = { ...(current.meta || {}), verify: data };
+      setRunProgressPhase(current, "正在核对引用…");
+      const label =
+        data.removed_citations > 0
+          ? "部分引用无法核实 · 已移除 " + data.removed_citations + " 条"
+          : (data.mode === "raw" ? "原始数据已返回" : (data.passed ? "核对通过" : "核对未通过"));
+      if (view) setRowStatus(view, "running", label);
+      return;
+    }
+    if (eventName === "usage") {
+      current.meta = { ...(current.meta || {}), budget: data };
+      setAgentStatus("已完成 · " + formatNumber(data.tools_used || 0) + " 个工具 · " + formatMs(data.elapsed_ms));
+      return;
+    }
+    if (eventName === "done") {
+      current.status = data.status || "done";
+      if (typeof data.answer === "string" && data.answer) current.content = data.answer;
+      stopResearchTimer();
+      if (view) {
+        renderAnswer(view.textNode, current.content, current.evidence, current.meta);
+        refreshLiveCounts(current);
+        renderVerifyLine(view, current);
+      }
+      finishRunProgress(current, current.status);
+      if (view) setRowStatus(view, current.status, statusInfo(current.status, current.meta).label);
+      setAgentStatus("完成 · " + statusInfo(current.status, current.meta).label);
+      return;
+    }
+    if (eventName === "error") {
+      current.status = "error";
+      stopResearchTimer();
+      finishRunProgress(current, "error");
+      if (view) setRowStatus(view, "error");
+      showError((data && data.message) || "回答失败");
+      setAgentStatus("回答失败");
+      return;
+    }
+    if (eventName === "ping") {
+      if (data && data.remaining_ms) setAgentStatus("仍在取数 · 剩余约 " + Math.ceil(data.remaining_ms / 1000) + " 秒");
+    }
+  }
+
   async function openConversation(id) {
     if (state.streaming || !id) return;
     state.pollToken += 1;
@@ -1375,10 +1527,66 @@
       renderHistory();
       const pending = [...state.messages].reverse().find((item) => item.role === "assistant");
       if (pending && pending.id && (pending.status === "running" || pending.status === "queued")) {
+        const runId = pending.meta && pending.meta.run_id;
+        if (runId) {
+          // research 任务：接事件流回放，失败再退回轮询。
+          const resumed = await replayRun(runId, pending, pollToken);
+          if (resumed) return;
+        }
         pollUntilSettled(id, pending.id, pending.created_at, pollToken);
       }
     } catch (error) {
       showError(error.message);
+    }
+  }
+
+  async function replayRun(runId, pending, pollToken) {
+    const live = state.messages.find((item) => item.id === pending.id);
+    if (!live) return false;
+    // renderHistory 已建好节点，重新挂到 currentAssistant 上供 applyAgentEvent 消费。
+    const row = document.querySelector('[data-message-id="' + CSS.escape(pending.id) + '"]');
+    if (!row) return false;
+    const textNode = row.querySelector(".answer-text, .answer-empty");
+    const body = row.querySelector(".message-body");
+    if (!textNode || !body) return false;
+    // 历史渲染不建执行过程卡片，回放要补一个，否则 tool_start 无处可写。
+    let progress = null;
+    const existing = row.querySelector(".run-progress");
+    if (existing) {
+      progress = {
+        details: existing,
+        meta: existing.querySelector(".run-progress-meta"),
+        body: existing.querySelector(".run-progress-body"),
+        empty: existing.querySelector(".run-progress-empty"),
+        hint: existing.querySelector(".run-progress-hint"),
+        steps: [],
+        phase: null,
+        finished: false,
+        timers: [],
+      };
+    } else {
+      progress = createRunProgress();
+      body.insertBefore(progress.details, body.firstChild);
+    }
+    state.currentAssistant = {
+      ...pending,
+      content: "",
+      evidence: pending.evidence || [],
+      meta: pending.meta || {},
+      view: { row, textNode, body, progress },
+    };
+    try {
+      await streamChat(null, (eventName, data) => {
+        if (pollToken !== state.pollToken) return;
+        applyAgentEvent(eventName, data);
+      }, {
+        method: "GET",
+        url: "/api/v1/research/" + encodeURIComponent(runId) + "/stream?after=0",
+      });
+      return true;
+    } catch (error) {
+      state.currentAssistant = null;
+      return false;
     }
   }
 
@@ -1526,115 +1734,7 @@
     let lastEventId = 0;
     const handle = (eventName, data, eventId) => {
       if (Number.isInteger(eventId)) lastEventId = Math.max(lastEventId, eventId);
-      const current = state.currentAssistant;
-      if (eventName === "meta") {
-        if (data.conversation_id && !state.activeId) {
-          state.activeId = data.conversation_id;
-          renderConversationList();
-        }
-        if (data.message_id) {
-          current.id = data.message_id;
-          if (current.view && current.view.row) current.view.row.dataset.messageId = data.message_id;
-        }
-        current.meta = { ...(current.meta || {}), ...data };
-        if (Number(data.attempt) > 1) {
-          current.content = "";
-          current.evidence = [];
-          if (state.liveTurn) {
-            state.evidenceTurns = state.evidenceTurns.filter((item) => item.turn !== state.liveTurn);
-            delete state.openTurns[state.liveTurn];
-            state.liveTurn = null;
-          }
-          renderEvidencePanel();
-          if (current.view) {
-            current.view.textNode.textContent = "";
-            current.view.textNode.classList.add("answer-empty");
-            current.view.textNode.classList.remove("answer-text");
-          }
-          resetRunProgress(current);
-          setAgentStatus("正在重试…");
-        }
-        return;
-      }
-      if (eventName === "plan") {
-        if (data.mode === "agentscope_auto") {
-          const allowed = Array.isArray(data.allowed) ? data.allowed.length : 0;
-          setAgentStatus("Agent 自主选择工具" + (allowed ? " · 可用 " + allowed + " 个" : ""));
-        } else {
-          const tools = Array.isArray(data.tools) ? data.tools.map((item) => item.name).join("、") : "";
-          setAgentStatus("已规划 · " + (data.intent || "unknown") + (tools ? " · " + tools : ""));
-        }
-        return;
-      }
-      if (eventName === "tool_start") {
-        startRunProgressStep(current, data);
-        setAgentStatus("正在取数 · " + progressLabelForTool(data.tool));
-        return;
-      }
-      if (eventName === "tool_end") {
-        const ok = data.status === "ok";
-        finishRunProgressStep(current, data);
-        setAgentStatus((ok ? "已取回" : "取数失败") + " · " + progressLabelForTool(data.tool) + " · " + formatMs(data.latency_ms));
-        return;
-      }
-      if (eventName === "evidence") {
-        const evidence = data && data.evidence;
-        if (evidence) registerLiveEvidence(current, evidence);
-        return;
-      }
-      if (eventName === "delta") {
-        setRunProgressPhase(current, "正在组织答案…");
-        if (data && typeof data.text === "string") appendDelta(current, data.text);
-        return;
-      }
-      if (eventName === "delta_reset") {
-        current.content = "";
-        if (current.view) {
-          current.view.textNode.textContent = "";
-          current.view.textNode.classList.add("answer-empty");
-          current.view.textNode.classList.remove("answer-text");
-        }
-        return;
-      }
-      if (eventName === "verify") {
-        current.meta = { ...(current.meta || {}), verify: data };
-        setRunProgressPhase(current, "正在核对引用…");
-        const label =
-          data.removed_citations > 0
-            ? "部分引用无法核实 · 已移除 " + data.removed_citations + " 条"
-            : (data.mode === "raw" ? "原始数据已返回" : (data.passed ? "核对通过" : "核对未通过"));
-        setRowStatus(view, "running", label);
-        return;
-      }
-      if (eventName === "usage") {
-        current.meta = { ...(current.meta || {}), budget: data };
-        setAgentStatus("已完成 · " + formatNumber(data.tools_used || 0) + " 个工具 · " + formatMs(data.elapsed_ms));
-        return;
-      }
-      if (eventName === "done") {
-        current.status = data.status || "done";
-        if (typeof data.answer === "string" && data.answer) current.content = data.answer;
-        stopResearchTimer();
-        renderAnswer(view.textNode, current.content, current.evidence, current.meta);
-        refreshLiveCounts(current);
-        renderVerifyLine(view, current);
-        finishRunProgress(current, current.status);
-        setRowStatus(view, current.status, statusInfo(current.status, current.meta).label);
-        setAgentStatus("完成 · " + statusInfo(current.status, current.meta).label);
-        return;
-      }
-      if (eventName === "error") {
-        current.status = "error";
-        stopResearchTimer();
-        finishRunProgress(current, "error");
-        setRowStatus(view, "error");
-        showError((data && data.message) || "回答失败");
-        setAgentStatus("回答失败");
-        return;
-      }
-      if (eventName === "ping") {
-        if (data && data.remaining_ms) setAgentStatus("仍在取数 · 剩余约 " + Math.ceil(data.remaining_ms / 1000) + " 秒");
-      }
+      applyAgentEvent(eventName, data);
     };
 
     const resume = async () => {

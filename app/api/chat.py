@@ -185,21 +185,20 @@ def _prepare_turn(
             created_at=created_at,
         )
     )
-    db.add(
-        Message(
-            id=message_id,
-            tenant_id=principal.tenant_id,
-            user_id=principal.user_id,
-            conversation_id=conversation.id,
-            request_id=request_id,
-            client_request_id=None,
-            role="assistant",
-            content="",
-            status="queued" if enqueue else "running",
-            meta={},
-            created_at=created_at + timedelta(microseconds=1),
-        )
+    assistant_message = Message(
+        id=message_id,
+        tenant_id=principal.tenant_id,
+        user_id=principal.user_id,
+        conversation_id=conversation.id,
+        request_id=request_id,
+        client_request_id=None,
+        role="assistant",
+        content="",
+        status="queued" if enqueue else "running",
+        meta={} if enqueue else {"mode": "chat"},
+        created_at=created_at + timedelta(microseconds=1),
     )
+    db.add(assistant_message)
     conversation.updated_at = created_at
     db.flush()
 
@@ -213,6 +212,8 @@ def _prepare_turn(
             message_id=message_id,
             request_id=request_id,
         )
+        # 会话列表靠 meta.run_id 判断能否连事件回放；同步聊天没有 run，只留 mode。
+        assistant_message.meta = {**(assistant_message.meta or {}), "run_id": str(run_id), "queued": True}
     return PreparedTurn(
         conversation_id=conversation.id,
         message_id=message_id,

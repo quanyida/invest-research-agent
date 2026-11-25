@@ -34,6 +34,25 @@ def _conversation_payload(row: Conversation) -> dict:
     }
 
 
+def _last_message_payload(row: Any) -> dict | None:
+    """会话列表用的最新消息摘要。
+
+    比 _message_payload 轻：不含证据、不查 citation_support，正文截断到 80 字。
+    meta 原样返回，前端要靠 meta.run_id 判断能否连事件回放。
+    """
+    if row is None:
+        return None
+    content = str(row["content"] or "")
+    meta = row["meta"] if isinstance(row["meta"], dict) else {}
+    return {
+        "id": str(row["id"]),
+        "status": row["status"],
+        "preview": content[:80],
+        "created_at": row["created_at"].isoformat(),
+        "meta": meta,
+    }
+
+
 def _mark_orphan_messages(db: Any, rows: list[Message]) -> int:
     """把超时的 running 消息就地标为失败。
 
@@ -164,7 +183,42 @@ def list_conversations(
             .order_by(Conversation.updated_at.desc())
             .limit(limit)
         ).all()
-        return {"items": [_conversation_payload(row) for row in rows]}
+        if not rows:
+            return {"items": []}
+        conv_ids = [row.id for row in rows]
+        # distinct on 依赖 messages_conversation_created_idx，一次查询取每个会话最新的一条助手消息。
+        latest_rows = db.execute(
+            text(
+                "select distinct on (conversation_id)"
+                "       conversation_id, id, status, content, created_at, meta"
+                "  from messages"
+                " where conversation_id = any(:ids)"
+                "   and role = 'assistant'"
+                " order by conversation_id, created_at desc"
+            ),
+            {"ids": conv_ids},
+        ).mappings().all()
+        latest_by_conv = {row["conversation_id"]: row for row in latest_rows}
+        count_rows = db.execute(
+            text(
+                "select conversation_id, count(*) as total"
+                "  from messages"
+                " where conversation_id = any(:ids)"
+                " group by conversation_id"
+            ),
+            {"ids": conv_ids},
+        ).mappings().all()
+        counts = {row["conversation_id"]: int(row["total"]) for row in count_rows}
+        return {
+            "items": [
+                {
+                    **_conversation_payload(row),
+                    "message_count": counts.get(row.id, 0),
+                    "last_message": _last_message_payload(latest_by_conv.get(row.id)),
+                }
+                for row in rows
+            ]
+        }
 
 
 @router.get("/{conversation_id}/messages")
