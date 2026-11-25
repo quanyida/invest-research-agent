@@ -199,10 +199,6 @@ class AgentScopeRunner:
         )
 
     @staticmethod
-    def _chunks(text: str, size: int = 40) -> list[str]:
-        return [text[index : index + size] for index in range(0, len(text), size)]
-
-    @staticmethod
     def _history_messages(history: list[dict[str, str]] | None) -> list[Any]:
         messages: list[Any] = []
         for item in history or []:
@@ -887,8 +883,8 @@ class AgentScopeRunner:
         verdict["repaired"] = revised
         verdict["degraded"] = degraded
         yield ("verify", verdict)
-        for chunk in self._chunks(final_answer):
-            yield ("delta", {"text": chunk})
+        # 正文已由模型流式下发（EventBridge 转发 TextBlockDeltaEvent）；
+        # 这里只补一份定稿，供前端在 done 时以校验后的文本为准。
         yield ("usage", usage)
         yield (
             "done",
@@ -900,5 +896,6 @@ class AgentScopeRunner:
                 "elapsed_ms": int((time.monotonic() - started) * 1000),
                 "agent_state_saved": saved,
                 "run_finalized": run_finalized,
+                "answer": final_answer,
             },
         )

@@ -6,6 +6,7 @@ from typing import Any
 from agentscope.event import (
     ModelCallEndEvent,
     ModelCallStartEvent,
+    TextBlockDeltaEvent,
     ToolCallStartEvent,
     ToolResultEndEvent,
 )
@@ -32,6 +33,7 @@ class EventBridge:
         self.budget = budget
         self.tool_names: dict[str, str] = {}
         self.model_starts: dict[str, float] = {}
+        self.streamed_replies: set[str] = set()
         self.llm_audits: list[dict[str, Any]] = []
         self.prompt_tokens = 0
         self.completion_tokens = 0
@@ -78,7 +80,18 @@ class EventBridge:
 
     def handle(self, event: Any) -> list[tuple[str, dict[str, Any]]]:
         out: list[tuple[str, dict[str, Any]]] = []
+        if isinstance(event, TextBlockDeltaEvent):
+            delta = getattr(event, "delta", "") or ""
+            if delta:
+                self.streamed_replies.add(str(getattr(event, "reply_id", "") or ""))
+                out.append(("delta", {"text": delta}))
+            return out
+
         if isinstance(event, ToolCallStartEvent):
+            reply_id = str(getattr(event, "reply_id", "") or "")
+            if reply_id and reply_id in self.streamed_replies:
+                self.streamed_replies.discard(reply_id)
+                out.append(("delta_reset", {"reason": "tool_call"}))
             self.tool_names[event.tool_call_id] = event.tool_call_name
             out.append(
                 (

@@ -298,6 +298,8 @@ def _absorb_sse(chunk: str, state: dict[str, Any]) -> None:
             continue
         if event == "delta":
             state["text"] = str(state.get("text") or "") + str(payload.get("text") or "")
+        elif event == "delta_reset":
+            state["text"] = ""
         elif event == "done":
             state["done"] = True
 

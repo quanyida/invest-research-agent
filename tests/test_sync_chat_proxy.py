@@ -246,3 +246,11 @@ def test_chat_busy_returns_409(monkeypatch):
 
     detail = getattr(raised.value, "detail", {})
     assert detail.get("code") == "CONVERSATION_BUSY"
+
+def test_absorb_sse_delta_reset_clears_accumulated_text():
+    state = {"buffer": "", "text": "", "done": False}
+    chat._absorb_sse('event: delta\ndata: {"text":"我先查一下"}\n\n', state)
+    assert state["text"] == "我先查一下"
+    chat._absorb_sse('event: delta_reset\ndata: {"reason":"tool_call"}\n\n', state)
+    assert state["text"] == ""
+    assert state["done"] is False

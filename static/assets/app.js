@@ -1587,6 +1587,15 @@
         if (data && typeof data.text === "string") appendDelta(current, data.text);
         return;
       }
+      if (eventName === "delta_reset") {
+        current.content = "";
+        if (current.view) {
+          current.view.textNode.textContent = "";
+          current.view.textNode.classList.add("answer-empty");
+          current.view.textNode.classList.remove("answer-text");
+        }
+        return;
+      }
       if (eventName === "verify") {
         current.meta = { ...(current.meta || {}), verify: data };
         setRunProgressPhase(current, "正在核对引用…");
@@ -1604,6 +1613,7 @@
       }
       if (eventName === "done") {
         current.status = data.status || "done";
+        if (typeof data.answer === "string" && data.answer) current.content = data.answer;
         stopResearchTimer();
         renderAnswer(view.textNode, current.content, current.evidence, current.meta);
         refreshLiveCounts(current);

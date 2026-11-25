@@ -34,6 +34,8 @@ logger = logging.getLogger(__name__)
 _LEGACY_DONE = object()
 ORPHAN_SWEEP_INTERVAL_SECONDS = 60.0
 EVENT_PURGE_INTERVAL_SECONDS = 600.0
+# 真流式下 delta 很密，落事件表前合并成小块，避免一轮产生上千行。
+_DELTA_FLUSH_CHARS = 200
 
 def _next_event(iterator: Any) -> Any:
     try:
@@ -188,12 +190,36 @@ class RunWorker:
 
         done = False
         run_finalized = False
+        pending: list[str] = []
+        pending_chars = 0
+
+        async def flush_delta() -> None:
+            nonlocal pending_chars
+            if not pending:
+                return
+            text = "".join(pending)
+            pending.clear()
+            pending_chars = 0
+            await asyncio.to_thread(append_event, ticket, "delta", {"text": text})
+
         try:
             async for event, data in self._stream(run, ticket.attempt):
+                if event == "delta":
+                    text = str(data.get("text") or "")
+                    pending.append(text)
+                    pending_chars += len(text)
+                    if pending_chars >= _DELTA_FLUSH_CHARS:
+                        await flush_delta()
+                    continue
+                if event == "delta_reset":
+                    pending.clear()
+                    pending_chars = 0
+                await flush_delta()
                 if event == "done":
                     done = True
                     run_finalized = bool(data.get("run_finalized"))
                 await asyncio.to_thread(append_event, ticket, event, data)
+            await flush_delta()
         except asyncio.CancelledError:
             raise
         except RunFenced:

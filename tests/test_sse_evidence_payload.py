@@ -59,3 +59,34 @@ def test_public_payload_keeps_tool_source_kind():
 
     assert payload["source_kind"] == "announcement"
     assert payload["source_kind_label"] == "公告"
+
+def test_event_bridge_forwards_text_delta():
+    from agentscope.event import TextBlockDeltaEvent
+
+    bridge = EventBridge(collector=SimpleNamespace(records=[]))
+    events = bridge.handle(
+        TextBlockDeltaEvent(reply_id="r1", block_id="b1", delta="市盈率")
+    )
+    assert events == [("delta", {"text": "市盈率"})]
+    assert "r1" in bridge.streamed_replies
+
+def test_event_bridge_resets_before_tool_call_after_streamed_text():
+    from agentscope.event import TextBlockDeltaEvent, ToolCallStartEvent
+
+    bridge = EventBridge(collector=SimpleNamespace(records=[]))
+    bridge.handle(TextBlockDeltaEvent(reply_id="r1", block_id="b1", delta="我先查一下"))
+    events = bridge.handle(
+        ToolCallStartEvent(reply_id="r1", tool_call_id="c1", tool_call_name="web.search")
+    )
+    assert events[0] == ("delta_reset", {"reason": "tool_call"})
+    assert ("tool_start", {"tool": events[1][1]["tool"], "tool_call_id": "c1"}) == events[1]
+    assert "r1" not in bridge.streamed_replies
+
+def test_event_bridge_no_reset_when_no_streamed_text():
+    from agentscope.event import ToolCallStartEvent
+
+    bridge = EventBridge(collector=SimpleNamespace(records=[]))
+    events = bridge.handle(
+        ToolCallStartEvent(reply_id="r9", tool_call_id="c9", tool_call_name="web.search")
+    )
+    assert all(name != "delta_reset" for name, _ in events)
