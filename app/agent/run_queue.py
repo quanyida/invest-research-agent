@@ -205,12 +205,19 @@ def sweep(max_attempts: int) -> list[tuple[QueueTicket, str]]:
         ).mappings().all()
         for row in rows:
             ticket = _ticket(row)
+            is_chat = ticket.run_type == "chat"
             # 普通聊天一次机会：3 秒的任务重跑收益低于复杂度，崩溃即判死。
             # 深度研究允许重跑一次（attempt < limit）。
-            if ticket.run_type == "chat":
+            if is_chat:
                 state = "failed"
             else:
                 state = "failed" if ticket.attempt >= limit else "queued"
+            code = "WORKER_LOST" if is_chat else "LEASE_EXPIRED"
+            message = (
+                "回答生成中断，请重新提问。"
+                if is_chat
+                else "执行中断，请重试。"
+            )
             db.execute(
                 text(
                     "select set_config('app.tenant_id', :tenant_id, true), "
@@ -226,26 +233,24 @@ def sweep(max_attempts: int) -> list[tuple[QueueTicket, str]]:
                     "       lease_until = null,"
                     "       finished_at = case when :state = 'failed' then now() else null end,"
                     "       error_code = case when :state = 'failed'"
-                    "                         then coalesce(error_code, 'LEASE_EXPIRED') else error_code end,"
+                    "                         then :code else error_code end,"
                     "       error_message = case when :state = 'failed'"
-                    "                            then coalesce(error_message, 'worker lease expired') else error_message end"
+                    "                            then :message else error_message end"
                     " where id = :id"
                     "   and status = 'running'"
                     "   and lease_until is not null"
                     "   and lease_until < now()"
                 ),
-                {"id": str(ticket.run_id), "state": state},
+                {
+                    "id": str(ticket.run_id),
+                    "state": state,
+                    "code": code,
+                    "message": message,
+                },
             )
             if int(result.rowcount or 0) != 1:
                 continue
             if state == "failed":
-                is_chat = ticket.run_type == "chat"
-                code = "WORKER_LOST" if is_chat else "LEASE_EXPIRED"
-                message = (
-                    "回答生成中断，请重新提问。"
-                    if is_chat
-                    else "执行中断，请重试。"
-                )
                 mark_assistant_failed_in_session(
                     db,
                     ticket.message_id,

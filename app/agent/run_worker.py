@@ -313,6 +313,8 @@ class RunWorker:
                     "message_id": str(ticket.message_id),
                     "conversation_id": str(ticket.conversation_id),
                     "request_id": str(ticket.request_id),
+                    # Agent 抛异常是确定性失败，重试也会同样失败：不给重试入口
+                    "retryable": False,
                 },
             )
             await asyncio.to_thread(
@@ -348,6 +350,8 @@ class RunWorker:
                     "message_id": str(ticket.message_id),
                     "conversation_id": str(ticket.conversation_id),
                     "request_id": str(ticket.request_id),
+                    # Agent 抛异常是确定性失败，重试也会同样失败：不给重试入口
+                    "retryable": False,
                 },
             )
             await asyncio.to_thread(
