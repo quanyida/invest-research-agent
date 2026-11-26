@@ -1,8 +1,7 @@
 """Agent Service 入口（:8001）。
 
-两种工作形式：
-1. 接收 API 转发的同步执行请求（``POST /execute``）
-2. 后台消费 research 队列（``RunWorker``）
+只做一件事：后台消费 chat_runs 队列，用 RunWorker 执行任务、写 session_events。
+API 层不直接调用这里，两者只通过数据库通信。
 
 只绑定内网地址（``127.0.0.1:8001``），不对外暴露。
 """
@@ -14,7 +13,6 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.agent.run_worker import RunWorker
-from app.agent_service.execute import router as execute_router
 from app.api.health import router as health_router
 from app.config import get_settings
 
@@ -22,6 +20,7 @@ logging.basicConfig(
     level=getattr(logging, get_settings().log_level, logging.INFO),
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -32,6 +31,7 @@ async def lifespan(_: FastAPI):
     finally:
         await worker.stop()
 
+
 app = FastAPI(
     title="投研 Agent Service",
     version="1.0.0",
@@ -39,4 +39,3 @@ app = FastAPI(
     lifespan=lifespan,
 )
 app.include_router(health_router)
-app.include_router(execute_router)

@@ -238,11 +238,12 @@ def test_api_layer_does_not_import_agent_service():
     ]
     assert offenders == []
 
-def test_agent_service_exposes_execute():
+def test_agent_service_only_runs_the_worker():
+    """Agent Service 不再暴露 /execute：API 与它只通过数据库通信。"""
     from app.agent_service_main import app
 
     paths = {route.path for route in app.routes}
-    assert "/execute" in paths
+    assert "/execute" not in paths, "同步转发端点已删除"
     assert "/healthz" in paths
     assert "/readyz" in paths
 
