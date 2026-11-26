@@ -257,7 +257,6 @@ def sweep(max_attempts: int) -> list[tuple[QueueTicket, str]]:
                     "failed",
                     code,
                     message,
-                    retryable=not is_chat,
                 )
                 # 同一事务补两条事件：观战中的前端靠它立刻收尾，
                 # 否则要等 EVENT_TAIL_TIMEOUT_SECONDS（600 秒）才断开。
@@ -272,7 +271,6 @@ def sweep(max_attempts: int) -> list[tuple[QueueTicket, str]]:
                         "status": "failed",
                         "message_id": str(ticket.message_id),
                         "conversation_id": str(ticket.conversation_id),
-                        "retryable": not is_chat,
                     },
                 )
             else:

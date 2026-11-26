@@ -302,7 +302,10 @@ class RunWorker:
                 )
                 return
             logger.exception("run %s failed", ticket.run_id)
-            error = {"code": type(exc).__name__, "message": "Agent 执行异常，请稍后重试。"}
+            error = {
+                "code": type(exc).__name__,
+                "message": "回答生成失败，请重新提问。",
+            }
             await asyncio.to_thread(append_event, ticket, "error", error)
             await asyncio.to_thread(
                 append_event,
@@ -313,8 +316,6 @@ class RunWorker:
                     "message_id": str(ticket.message_id),
                     "conversation_id": str(ticket.conversation_id),
                     "request_id": str(ticket.request_id),
-                    # Agent 抛异常是确定性失败，重试也会同样失败：不给重试入口
-                    "retryable": False,
                 },
             )
             await asyncio.to_thread(
@@ -324,8 +325,7 @@ class RunWorker:
                 ticket.message_id,
                 "error",
                 type(exc).__name__,
-                "Agent 执行异常，请稍后重试。",
-                False,
+                "回答生成失败，请重新提问。",
             )
             await asyncio.to_thread(
                 mark_events_expiring, ticket.tenant_id, ticket.user_id, ticket.message_id
@@ -351,8 +351,6 @@ class RunWorker:
                     "message_id": str(ticket.message_id),
                     "conversation_id": str(ticket.conversation_id),
                     "request_id": str(ticket.request_id),
-                    # Agent 抛异常是确定性失败，重试也会同样失败：不给重试入口
-                    "retryable": False,
                 },
             )
             await asyncio.to_thread(
@@ -362,8 +360,7 @@ class RunWorker:
                 ticket.message_id,
                 "error",
                 "PERSIST_FAILED",
-                "回答保存失败，请稍后重试。",
-                False,
+                "回答保存失败，请重新提问。",
             )
             await asyncio.to_thread(
                 mark_events_expiring, ticket.tenant_id, ticket.user_id, ticket.message_id

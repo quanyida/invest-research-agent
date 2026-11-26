@@ -1,15 +1,18 @@
 # -*- coding: utf-8 -*-
-"""失败路径的 meta 契约：retryable 必须显式传递，run_id 不能被冲掉。
+"""失败路径的契约。
 
-这两个性质在实现里被踩过两次：
-  1. persist_turn 直接覆盖 meta，把 run_id 冲掉了 —— 刷新后再也找不到 run
-  2. mark_assistant_failed 没接 retryable，聊天失败也写成 True
-
-用假 session 直接验函数契约，不需要真库。
+钉住三件事（每一项都在实现里被踩过）：
+  1. 失败写入必须保留 run_id / run_type —— 被覆盖过两次，
+     冲掉之后刷新就再也找不到这条 run
+  2. 失败一律可重问，不按异常类型分类 —— 分类必然漏，
+     漏掉的那一类用户只能自己重打问题
+  3. 失败必须同时写 error 与 done 事件 —— 只写状态不写事件，
+     观战中的前端要干等 600 秒超时
 """
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -48,64 +51,36 @@ def fake_message(monkeypatch):
     return row, db
 
 
-def test_failed_payload_defaults_to_retryable():
+def test_failed_payload_has_no_retry_classification():
+    """payload 不再携带 retryable：是否给重问入口不该由错误类型决定。"""
     _content, meta = persist.failed_message_payload("X", "msg")
-    assert meta["retryable"] is True
-
-
-def test_failed_payload_honours_retryable_false():
-    _content, meta = persist.failed_message_payload("X", "msg", retryable=False)
-    assert meta["retryable"] is False
+    assert "retryable" not in meta
+    assert meta["error"]["code"] == "X"
 
 
 def test_failed_message_keeps_run_id(fake_message):
     """run_id 是刷新后接回放流的唯一线索，失败时不能被覆盖掉。"""
     row, db = fake_message
     ok = persist.mark_assistant_failed_in_session(
-        db, MESSAGE, "failed", "WORKER_LOST", "中断了", retryable=False
+        db, MESSAGE, "failed", "WORKER_LOST", "中断了"
     )
     assert ok is True
     assert row.meta["run_id"] == "run-abc"
     assert row.meta["run_type"] == "chat"
-    assert row.meta["retryable"] is False
+    assert row.status == "failed"
 
 
-def test_mark_assistant_failed_forwards_retryable(fake_message):
-    """外层包装必须把 retryable 透传下去，否则聊天失败会写成可重试。"""
+def test_mark_assistant_failed_wrapper_keeps_run_id(fake_message):
     row, _db = fake_message
     ok = persist.mark_assistant_failed(
-        TENANT, USER, MESSAGE, "error", "RateLimitError", "异常", False
+        TENANT, USER, MESSAGE, "error", "RateLimitError", "失败了"
     )
     assert ok is True
-    assert row.meta["retryable"] is False
+    assert row.meta["run_id"] == "run-abc"
 
 
-def test_mark_assistant_failed_default_is_retryable(fake_message):
-    """不传时保持原行为（研究路径的历史调用依赖这个默认值）。"""
-    row, _db = fake_message
-    ok = persist.mark_assistant_failed(
-        TENANT, USER, MESSAGE, "error", "SOME", "异常"
-    )
-    assert ok is True
-    assert row.meta["retryable"] is True
-
-
-def test_worker_error_path_passes_retryable_false(monkeypatch):
-    """worker 的异常收尾必须显式传 False —— 这是 bug1 的回归点。"""
-    marks: list[tuple] = []
-    events: list[tuple] = []
-
-    monkeypatch.setattr(
-        run_worker, "mark_assistant_failed", lambda *args: marks.append(args)
-    )
-    monkeypatch.setattr(
-        run_worker, "append_event", lambda ticket, event, data: events.append((event, data))
-    )
-    monkeypatch.setattr(run_worker, "mark_events_expiring", lambda *a, **k: 0)
-    monkeypatch.setattr(run_worker, "finish", lambda *a, **k: None)
-    monkeypatch.setattr(run_worker, "run_status", lambda *a, **k: "running")
-
-    ticket = run_worker.QueueTicket(
+def _ticket(**over) -> run_worker.QueueTicket:
+    base = dict(
         run_id=uuid.uuid4(),
         tenant_id=TENANT,
         user_id=USER,
@@ -115,36 +90,93 @@ def test_worker_error_path_passes_retryable_false(monkeypatch):
         attempt=1,
         run_type="chat",
     )
+    base.update(over)
+    return run_worker.QueueTicket(**base)
 
-    worker = run_worker.RunWorker.__new__(run_worker.RunWorker)
-    # _execute_inner 读 self.settings（真构造要连库，这里只给需要的字段）
-    worker.settings = SimpleNamespace()
+
+def _worker():
+    w = run_worker.RunWorker.__new__(run_worker.RunWorker)
+    w.settings = SimpleNamespace()
+    return w
+
+
+def test_worker_error_path_writes_both_events(monkeypatch):
+    """失败必须写 error + done，前端才能立刻收尾。"""
+    events: list[tuple] = []
+    marks: list[tuple] = []
+
+    monkeypatch.setattr(
+        run_worker, "append_event", lambda t, e, d: events.append((e, d))
+    )
+    monkeypatch.setattr(
+        run_worker, "mark_assistant_failed", lambda *a: marks.append(a)
+    )
+    monkeypatch.setattr(run_worker, "mark_events_expiring", lambda *a, **k: 0)
+    monkeypatch.setattr(run_worker, "finish", lambda *a, **k: None)
+    monkeypatch.setattr(run_worker, "run_status", lambda *a, **k: "running")
+    monkeypatch.setattr(
+        run_worker,
+        "load_chat_run",
+        lambda *_a, **_k: SimpleNamespace(
+            conversation_id=uuid.uuid4(),
+            message_id=MESSAGE,
+            request_id=uuid.uuid4(),
+            turn=1,
+        ),
+    )
+
+    worker = _worker()
 
     async def boom(_run, _attempt):
         if False:  # pragma: no cover
             yield
         raise RuntimeError("model exploded")
 
-    # _execute_inner 里 first thing 是 load_chat_run
+    monkeypatch.setattr(worker, "_stream", boom)
+    asyncio.run(worker._execute_inner(_ticket()))
+
+    names = [e for e, _ in events]
+    assert "error" in names, "必须写 error 事件"
+    assert "done" in names, "必须写 done 事件，否则前端等超时"
+    assert marks, "必须标记消息失败"
+
+    done = [d for e, d in events if e == "done"][0]
+    assert "retryable" not in done, "done 事件不再携带 retryable"
+
+
+@pytest.mark.parametrize("run_type", ["chat", "research"])
+def test_failure_events_do_not_branch_on_error_kind(monkeypatch, run_type):
+    """chat 与 research 的失败事件结构一致：不给前端分类信号。"""
+    events: list[tuple] = []
+    monkeypatch.setattr(
+        run_worker, "append_event", lambda t, e, d: events.append((e, d))
+    )
+    monkeypatch.setattr(run_worker, "mark_assistant_failed", lambda *a: None)
+    monkeypatch.setattr(run_worker, "mark_events_expiring", lambda *a, **k: 0)
+    monkeypatch.setattr(run_worker, "finish", lambda *a, **k: None)
+    monkeypatch.setattr(run_worker, "run_status", lambda *a, **k: "running")
     monkeypatch.setattr(
         run_worker,
         "load_chat_run",
         lambda *_a, **_k: SimpleNamespace(
-            conversation_id=ticket.conversation_id,
-            message_id=ticket.message_id,
-            request_id=ticket.request_id,
+            conversation_id=uuid.uuid4(),
+            message_id=MESSAGE,
+            request_id=uuid.uuid4(),
             turn=1,
         ),
     )
+
+    worker = _worker()
+
+    async def boom(_run, _attempt):
+        if False:  # pragma: no cover
+            yield
+        raise ValueError("any error")
+
     monkeypatch.setattr(worker, "_stream", boom)
+    asyncio.run(worker._execute_inner(_ticket(run_type=run_type)))
 
-    import asyncio
-
-    asyncio.run(worker._execute_inner(ticket))
-
-    assert marks, "异常路径必须标记消息失败"
-    assert marks[0][-1] is False, f"retryable 应为 False，实际 {marks[0][-1]}"
-
-    done = [d for e, d in events if e == "done"]
-    assert done, "必须写 done 事件让前端收尾"
-    assert done[0]["retryable"] is False
+    done = [d for e, d in events if e == "done"][0]
+    assert "retryable" not in done
+    # 两种类型都不额外加限制字段
+    assert set(done) == {"status", "message_id", "conversation_id", "request_id"}

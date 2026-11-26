@@ -330,7 +330,6 @@ def persist_turn(
 def failed_message_payload(
     code: str,
     message: str,
-    retryable: bool = True,
 ) -> tuple[str, dict[str, Any]]:
     content = (
         "结论：本次回答未完成。\n"
@@ -340,8 +339,6 @@ def failed_message_payload(
     )
     meta = {
         "error": {"code": code, "message": message},
-        # 前端据此决定给「重试」还是「重新提问」；轮询路径读 meta 而不是事件流。
-        "retryable": retryable,
         "failed_at": datetime.now(timezone.utc).isoformat(),
     }
     return content, meta
@@ -352,13 +349,12 @@ def mark_assistant_failed_in_session(
     status: str,
     code: str,
     message: str,
-    retryable: bool = True,
 ) -> bool:
     """在调用方事务内同步助手消息状态，供租约回收与任务状态一起提交。"""
     row = db.scalar(select(Message).where(Message.id == message_id))
     if row is None or row.status not in {"queued", "running"}:
         return False
-    content, meta = failed_message_payload(code, message, retryable)
+    content, meta = failed_message_payload(code, message)
     row.content = content
     row.status = status
     # 保留 run_id / run_type：失败后前端仍要能连回放看已生成的部分
@@ -374,17 +370,12 @@ def mark_assistant_failed(
     status: str,
     code: str,
     message: str,
-    retryable: bool = True,
 ) -> bool:
-    """把仍处于 running 的助手消息标记为失败，避免重启后留僵尸。
-
-    ``retryable`` 要跟着调用方传：普通聊天失败后不该自动重试，
-    传默认值 True 会让 meta 与 run_type 语义矛盾。
-    """
+    """把仍处于 running 的助手消息标记为失败，避免重启后留僵尸。"""
     try:
         with tenant_scope(tenant_id, user_id) as db:
             return mark_assistant_failed_in_session(
-                db, message_id, status, code, message, retryable
+                db, message_id, status, code, message
             )
     except Exception:
         logger.exception("failed to mark assistant message %s", message_id)

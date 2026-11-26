@@ -622,6 +622,10 @@
     row.append(meta, body);
     const view = { row, textNode, statusLabelNode, statusDotNode, body, progress };
     renderVerifyLine(view, message);
+    // 刷新后从库里读到失败消息，也要能重新提问，否则用户只能自己重打
+    if (message.role === "assistant" && isFailureStatus(message.status)) {
+      renderRetryAction(view, message, "重新提问");
+    }
     return view;
   }
 
@@ -1394,6 +1398,12 @@
     if (input) input.focus();
   }
 
+  const FAILURE_STATUSES = new Set(["failed", "error", "cancelled"]);
+
+  function isFailureStatus(status) {
+    return FAILURE_STATUSES.has(String(status || ""));
+  }
+
   function applyAgentEvent(eventName, data) {
     const current = state.currentAssistant;
     if (!current) return;
@@ -1524,8 +1534,9 @@
       finishRunProgress(current, current.status);
       if (view) setRowStatus(view, current.status, statusInfo(current.status, current.meta).label);
       setAgentStatus("完成 · " + statusInfo(current.status, current.meta).label);
-      // retryable=false（普通聊天）不自动重试，给一个明确的「重新提问」
-      if (current.status === "failed" && data.retryable === false && view) {
+      // 失败就给「重新提问」：这个入口的存在只取决于「失败了」，
+      // 不按错误类型分类——分类必然会漏，漏掉用户就得自己重打问题。
+      if (isFailureStatus(current.status) && view) {
         renderRetryAction(view, current, "重新提问");
       }
       return;
@@ -1534,7 +1545,10 @@
       current.status = "error";
       stopResearchTimer();
       finishRunProgress(current, "error");
-      if (view) setRowStatus(view, "error");
+      if (view) {
+        setRowStatus(view, "error");
+        renderRetryAction(view, current, "重新提问");
+      }
       showError((data && data.message) || "回答失败");
       setAgentStatus("回答失败");
       return;
