@@ -325,6 +325,7 @@ class RunWorker:
                 "error",
                 type(exc).__name__,
                 "Agent 执行异常，请稍后重试。",
+                False,
             )
             await asyncio.to_thread(
                 mark_events_expiring, ticket.tenant_id, ticket.user_id, ticket.message_id
@@ -362,6 +363,7 @@ class RunWorker:
                 "error",
                 "PERSIST_FAILED",
                 "回答保存失败，请稍后重试。",
+                False,
             )
             await asyncio.to_thread(
                 mark_events_expiring, ticket.tenant_id, ticket.user_id, ticket.message_id

@@ -374,11 +374,18 @@ def mark_assistant_failed(
     status: str,
     code: str,
     message: str,
+    retryable: bool = True,
 ) -> bool:
-    """把仍处于 running 的助手消息标记为失败，避免重启后留僵尸。"""
+    """把仍处于 running 的助手消息标记为失败，避免重启后留僵尸。
+
+    ``retryable`` 要跟着调用方传：普通聊天失败后不该自动重试，
+    传默认值 True 会让 meta 与 run_type 语义矛盾。
+    """
     try:
         with tenant_scope(tenant_id, user_id) as db:
-            return mark_assistant_failed_in_session(db, message_id, status, code, message)
+            return mark_assistant_failed_in_session(
+                db, message_id, status, code, message, retryable
+            )
     except Exception:
         logger.exception("failed to mark assistant message %s", message_id)
         return False
