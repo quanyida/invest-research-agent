@@ -141,6 +141,9 @@ a { color: inherit; text-decoration: none; }
 .conversation-status[data-tone="warn"]::before { background: var(--warning); }
 .conversation-status[data-tone="fail"]::before { background: var(--negative); }
 .conversation-preview { display: block; overflow: hidden; margin-top: 3px; color: var(--muted); font-size: 11px; line-height: 1.45; text-overflow: ellipsis; white-space: nowrap; }
+.answer-retry { display: inline-block; margin-top: 10px; padding: 6px 14px; border: 0; border-radius: var(--control-radius); background: var(--accent); color: #fff; font-size: 13px; line-height: 1.4; cursor: pointer; }
+.answer-retry:hover { opacity: 0.88; }
+.answer-retry:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .sidebar-foot { margin-top: auto; padding-top: 12px; border-top: 1px solid var(--border); }
 .sidebar-links { display: flex; flex-direction: column; gap: 2px; margin-bottom: 12px; }
 .sidebar-link { display: flex; align-items: center; min-height: 32px; padding: 0 9px; border-radius: var(--control-radius); color: var(--muted); font-size: 13px; }

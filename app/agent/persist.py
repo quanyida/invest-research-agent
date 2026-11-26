@@ -191,7 +191,10 @@ def persist_turn(
             raise RuntimeError("assistant message not found")
         message.content = answer
         message.status = status
-        message.meta = json_safe(meta)
+        # 合并而非覆盖：meta 里的 run_id / run_type 是刷新后接回放流的唯一线索，
+        # 被终态写入冲掉的话前端就再也找不到这条 run。
+        previous = message.meta if isinstance(message.meta, dict) else {}
+        message.meta = {**previous, **json_safe(meta)}
 
         for evidence in evidences:
             db.add(_evidence_row(tenant_id, user_id, message_id, evidence))
@@ -324,15 +327,21 @@ def persist_turn(
 
     return state_saved, run_finalized
 
-def failed_message_payload(code: str, message: str) -> tuple[str, dict[str, Any]]:
+def failed_message_payload(
+    code: str,
+    message: str,
+    retryable: bool = True,
+) -> tuple[str, dict[str, Any]]:
     content = (
         "结论：本次回答未完成。\n"
         "依据：服务端没有保存到可用的完整回答。\n"
         "关键数据：本轮无关键数字。\n"
-        f"待确认：{message}；请稍后重试。"
+        f"待确认：{message}"
     )
     meta = {
         "error": {"code": code, "message": message},
+        # 前端据此决定给「重试」还是「重新提问」；轮询路径读 meta 而不是事件流。
+        "retryable": retryable,
         "failed_at": datetime.now(timezone.utc).isoformat(),
     }
     return content, meta
@@ -343,15 +352,18 @@ def mark_assistant_failed_in_session(
     status: str,
     code: str,
     message: str,
+    retryable: bool = True,
 ) -> bool:
     """在调用方事务内同步助手消息状态，供租约回收与任务状态一起提交。"""
     row = db.scalar(select(Message).where(Message.id == message_id))
     if row is None or row.status not in {"queued", "running"}:
         return False
-    content, meta = failed_message_payload(code, message)
+    content, meta = failed_message_payload(code, message, retryable)
     row.content = content
     row.status = status
-    row.meta = meta
+    # 保留 run_id / run_type：失败后前端仍要能连回放看已生成的部分
+    previous = row.meta if isinstance(row.meta, dict) else {}
+    row.meta = {**previous, **meta}
     row.updated_at = datetime.now(timezone.utc)
     return True
 

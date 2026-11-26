@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import asyncio
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import UUID
 
 import pytest
 from fastapi import HTTPException
@@ -59,31 +61,41 @@ def test_research_returns_run_id_and_stream_url(monkeypatch):
     payload = chat.research(chat.ChatBody(message="深度研究一下瑞芯微"), _Request())
 
     assert payload["run_id"] == str(RUN)
-    assert payload["stream_url"] == f"/api/v1/research/{RUN}/stream"
+    assert payload["stream_url"] == f"/api/v1/runs/{RUN}/events"
     assert uuid.UUID(payload["message_id"])
     assert uuid.UUID(payload["conversation_id"])
     assistant = [item for item in db.added if getattr(item, "role", None) == "assistant"]
     assert len(assistant) == 1
     assert assistant[0].status == "queued"
+    assert assistant[0].meta["run_type"] == "research"
 
-def test_chat_does_not_enqueue_and_starts_running(monkeypatch):
+def test_chat_enqueues_as_chat_type(monkeypatch):
+    """普通聊天也投队列，但 run_type=chat：崩溃后不重试。"""
     db = _patch_request(monkeypatch)
-    calls: list[int] = []
-    monkeypatch.setattr(chat.run_queue, "enqueue", lambda *_a, **_k: calls.append(1) or RUN)
+    seen: dict[str, object] = {}
+
+    def fake_enqueue(*_a, **kwargs):
+        seen.update(kwargs)
+        return RUN
+
+    monkeypatch.setattr(chat.run_queue, "enqueue", fake_enqueue)
 
     response = chat.chat(chat.ChatBody(message="问题二"), _Request())
 
     assert isinstance(response, StreamingResponse)
-    assert calls == []
+    assert seen.get("run_type") == "chat"
     assistant = [
         item for item in db.added if getattr(item, "role", None) == "assistant"
     ]
     assert len(assistant) == 1
-    assert assistant[0].status == "running"
+    # 投队列后状态是 queued，由 worker 抢占改成 running
+    assert assistant[0].status == "queued"
+    assert assistant[0].meta["run_type"] == "chat"
+    assert assistant[0].meta["run_id"] == str(RUN)
 
 def test_research_stream_rejects_unknown_run(monkeypatch):
     _patch_request(monkeypatch)
-    monkeypatch.setattr(chat.run_queue, "research_target", lambda *_a: None)
+    monkeypatch.setattr(chat.run_queue, "load_run", lambda *_a, **_k: None)
 
     with pytest.raises(HTTPException) as raised:
         chat.research_stream(RUN, _Request(), 0)
@@ -94,33 +106,121 @@ def test_research_stream_rejects_unknown_run(monkeypatch):
 def test_research_stream_replays_from_cursor(monkeypatch):
     _patch_request(monkeypatch)
     captured: dict[str, object] = {}
-    monkeypatch.setattr(chat.run_queue, "research_target", lambda *_a: MESSAGE)
 
-    def fake_events(tenant_id, user_id, message_id, after, **_kwargs):
-        captured.update(
-            tenant_id=tenant_id,
-            user_id=user_id,
-            message_id=message_id,
-            after=after,
-        )
+    monkeypatch.setattr(
+        chat.run_queue,
+        "load_run",
+        lambda *_a, **_k: {
+            "id": RUN,
+            "message_id": MESSAGE,
+            "conversation_id": UUID("00000000-0000-0000-0000-0000000000cc"),
+            "run_type": "research",
+            "status": "running",
+            "attempt": 1,
+        },
+    )
 
-        async def _gen():
-            if False:  # pragma: no cover - 只为得到 async generator
-                yield ""
+    def fake_tail(principal, run_id, run_type, cursor):
+        captured.update(run_id=run_id, run_type=run_type, cursor=cursor)
+        return _empty_stream()
 
-        return _gen()
-
-    monkeypatch.setattr(chat, "_stream_events", fake_events)
+    monkeypatch.setattr(chat, "_tail_run", fake_tail)
 
     response = chat.research_stream(RUN, _Request(headers={"last-event-id": "7"}), 3)
-
     assert isinstance(response, StreamingResponse)
-    assert captured == {
-        "tenant_id": TENANT,
-        "user_id": USER,
+
+    # 游标由 _resolve_cursor 在端点入口算好，这里直接验证它
+    assert chat._resolve_cursor(3, _Request(headers={"last-event-id": "7"})) == 7
+    assert chat._resolve_cursor(9, _Request(headers={"last-event-id": "7"})) == 9
+
+def test_run_events_rejects_foreign_run(monkeypatch):
+    """别人的 run 一律 404，不泄露存在性。"""
+    _patch_request(monkeypatch)
+    monkeypatch.setattr(chat.run_queue, "load_run", lambda *_a, **_k: None)
+
+    with pytest.raises(HTTPException) as raised:
+        chat.run_events(RUN, _Request(), after_seq=0)
+
+    assert raised.value.status_code == 404
+
+def test_chat_run_first_replay_uses_last_snapshot(monkeypatch):
+    """chat 首帧恢复只吐最后一条 snapshot，不逐条重绘。
+
+    只验证分流决策：chat + after_seq=0 时查一次 last_snapshot，
+    并把游标退到快照前一条；不跑完整流（那需要真实终态）。
+    """
+    _patch_request(monkeypatch)
+    calls: list[tuple] = []
+
+    def fake_snapshot(tenant_id, user_id, run_id):
+        calls.append((tenant_id, user_id, run_id))
+        return {"id": 42, "event": "snapshot", "data": {"text": "已生成的内容"}}
+
+    monkeypatch.setattr(chat.run_queue, "last_snapshot", fake_snapshot)
+    monkeypatch.setattr(chat, "_tail_run", lambda *a, **k: _empty_stream())
+
+    run = {
+        "id": RUN,
         "message_id": MESSAGE,
-        "after": 7,
+        "conversation_id": UUID("00000000-0000-0000-0000-0000000000cc"),
+        "run_type": "chat",
+        "status": "running",
+        "attempt": 1,
     }
+
+    seen: dict[str, object] = {}
+
+    def capture_tail(principal, run_id, run_type, cursor):
+        seen.update(run_type=run_type, cursor=cursor)
+        return _empty_stream()
+
+    monkeypatch.setattr(chat, "_tail_run", capture_tail)
+
+    async def drain():
+        chunks = []
+        async for chunk in chat._replay_run(_principal(), run, 0):
+            chunks.append(chunk)
+        return chunks
+
+    asyncio.run(drain())
+
+    assert calls == [(TENANT, USER, RUN)], "chat 的 after_seq=0 应该查一次最后快照"
+    # 游标退到快照前一条，让重放把它吐出来
+    assert seen == {"run_type": "chat", "cursor": 41}
+
+
+def _empty_stream():
+    async def _gen():
+        if False:  # pragma: no cover
+            yield ""
+
+    return _gen()
+
+
+def test_research_run_does_not_snapshot(monkeypatch):
+    """research 逐条重放，不查快照。"""
+    _patch_request(monkeypatch)
+    calls: list[int] = []
+    monkeypatch.setattr(
+        chat.run_queue, "last_snapshot", lambda *a, **k: calls.append(1) or None
+    )
+    monkeypatch.setattr(chat, "_tail_run", lambda *a, **k: _empty_stream())
+
+    run = {
+        "id": RUN,
+        "message_id": MESSAGE,
+        "conversation_id": UUID("00000000-0000-0000-0000-0000000000cc"),
+        "run_type": "research",
+        "status": "running",
+        "attempt": 1,
+    }
+
+    async def drain():
+        async for _ in chat._replay_run(_principal(), run, 0):
+            pass
+
+    asyncio.run(drain())
+    assert calls == [], "research 不该走快照路径"
 
 def test_entry_points_renamed():
     assert (ROOT / "app" / "api_main.py").is_file()

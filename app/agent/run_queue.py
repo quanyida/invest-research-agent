@@ -30,6 +30,7 @@ class QueueTicket:
     request_id: uuid.UUID
     attempt: int = 0
     worker_id: str | None = None
+    run_type: str = "research"
 
 def _ticket(row: Any) -> QueueTicket:
     return QueueTicket(
@@ -41,6 +42,7 @@ def _ticket(row: Any) -> QueueTicket:
         request_id=row["request_id"],
         attempt=int(row["attempt"] or 0),
         worker_id=row.get("worker_id"),
+        run_type=str(row.get("run_type") or "research"),
     )
 
 def enqueue(
@@ -51,18 +53,28 @@ def enqueue(
     conversation_id: uuid.UUID,
     message_id: uuid.UUID,
     request_id: uuid.UUID,
+    run_type: str = "research",
+    priority: int | None = None,
 ) -> uuid.UUID:
     """在调用方事务内写入一条待执行任务。
 
     依赖 ``chat_runs_one_active`` 唯一索引保证同会话串行；
     冲突会抛 ``IntegrityError``，由调用方转成 409。
+
+    ``run_type`` 决定 worker 用哪一组协程消费它，也决定崩溃后是否重试。
+    ``priority`` 越小越先被抢占；不传时 chat=10、research=100。
     """
     run_id = uuid.uuid4()
+    resolved_priority = priority if priority is not None else (
+        10 if run_type == "chat" else 100
+    )
     db.execute(
         text(
             "insert into chat_runs "
-            "(id, tenant_id, user_id, conversation_id, message_id, request_id) "
-            "values (:id, :tenant_id, :user_id, :conversation_id, :message_id, :request_id)"
+            "(id, tenant_id, user_id, conversation_id, message_id, request_id,"
+            " run_type, priority) "
+            "values (:id, :tenant_id, :user_id, :conversation_id, :message_id,"
+            " :request_id, :run_type, :priority)"
         ),
         {
             "id": str(run_id),
@@ -71,19 +83,30 @@ def enqueue(
             "conversation_id": str(conversation_id),
             "message_id": str(message_id),
             "request_id": str(request_id),
+            "run_type": run_type,
+            "priority": int(resolved_priority),
         },
     )
     return run_id
 
-def claim(worker_id: str, lease_seconds: float) -> QueueTicket | None:
-    """跨进程抢占一条 queued 任务，使用 SKIP LOCKED 避免互相等待。"""
+def claim(
+    worker_id: str,
+    lease_seconds: float,
+    run_type: str = "research",
+) -> QueueTicket | None:
+    """跨进程抢占一条 queued 任务，使用 SKIP LOCKED 避免互相等待。
+
+    只抢 ``run_type`` 匹配的任务：普通聊天和深度研究各用一组协程，
+    长任务占满自己的槽也不会挡住短任务。
+    """
     with session_scope() as db:
         row = db.execute(
             text(
                 "with picked as ("
                 "  select id from chat_runs"
                 "  where status = 'queued'"
-                "  order by created_at"
+                "    and run_type = :run_type"
+                "  order by priority, created_at"
                 "  for update skip locked"
                 "  limit 1"
                 ")"
@@ -96,11 +119,42 @@ def claim(worker_id: str, lease_seconds: float) -> QueueTicket | None:
                 "   from picked"
                 "  where r.id = picked.id"
                 " returning r.id, r.tenant_id, r.user_id, r.conversation_id,"
-                "           r.message_id, r.request_id, r.attempt, r.worker_id"
+                "           r.message_id, r.request_id, r.attempt, r.worker_id,"
+                "           r.run_type"
             ),
-            {"worker_id": worker_id, "lease": float(lease_seconds)},
+            {"worker_id": worker_id, "lease": float(lease_seconds), "run_type": run_type},
         ).mappings().first()
     return _ticket(row) if row is not None else None
+
+def renew_lease(
+    run_id: uuid.UUID,
+    worker_id: str,
+    attempt: int,
+    lease_seconds: float,
+) -> bool:
+    """续租；worker_id 或 attempt 不匹配说明已被回收，返回 False。
+
+    两个条件都要带：``worker_id`` 挡住「另一个 worker 接手」，
+    ``attempt`` 挡住「自己重启后拿到旧 ticket」。
+    """
+    with session_scope() as db:
+        result = db.execute(
+            text(
+                "update chat_runs"
+                "   set lease_until = now() + (:lease * interval '1 second')"
+                " where id = :id"
+                "   and worker_id = :worker_id"
+                "   and attempt = :attempt"
+                "   and status = 'running'"
+            ),
+            {
+                "id": str(run_id),
+                "worker_id": worker_id,
+                "attempt": int(attempt),
+                "lease": float(lease_seconds),
+            },
+        )
+        return int(result.rowcount or 0) == 1
 
 def finish(
     run_id: uuid.UUID,
@@ -140,7 +194,7 @@ def sweep(max_attempts: int) -> list[tuple[QueueTicket, str]]:
         rows = db.execute(
             text(
                 "select id, tenant_id, user_id, conversation_id, message_id,"
-                "       request_id, attempt, worker_id"
+                "       request_id, attempt, worker_id, run_type"
                 " from chat_runs"
                 " where status = 'running'"
                 "   and lease_until is not null"
@@ -151,7 +205,12 @@ def sweep(max_attempts: int) -> list[tuple[QueueTicket, str]]:
         ).mappings().all()
         for row in rows:
             ticket = _ticket(row)
-            state = "failed" if ticket.attempt >= limit else "queued"
+            # 普通聊天一次机会：3 秒的任务重跑收益低于复杂度，崩溃即判死。
+            # 深度研究允许重跑一次（attempt < limit）。
+            if ticket.run_type == "chat":
+                state = "failed"
+            else:
+                state = "failed" if ticket.attempt >= limit else "queued"
             db.execute(
                 text(
                     "select set_config('app.tenant_id', :tenant_id, true), "
@@ -180,12 +239,36 @@ def sweep(max_attempts: int) -> list[tuple[QueueTicket, str]]:
             if int(result.rowcount or 0) != 1:
                 continue
             if state == "failed":
+                is_chat = ticket.run_type == "chat"
+                code = "WORKER_LOST" if is_chat else "LEASE_EXPIRED"
+                message = (
+                    "回答生成中断，请重新提问。"
+                    if is_chat
+                    else "执行中断，请重试。"
+                )
                 mark_assistant_failed_in_session(
                     db,
                     ticket.message_id,
                     "failed",
-                    "LEASE_EXPIRED",
-                    "Worker 意外中断，任务已终止，请重试。",
+                    code,
+                    message,
+                    retryable=not is_chat,
+                )
+                # 同一事务补两条事件：观战中的前端靠它立刻收尾，
+                # 否则要等 EVENT_TAIL_TIMEOUT_SECONDS（600 秒）才断开。
+                append_event_in_session(
+                    db, ticket, "error", {"code": code, "message": message}
+                )
+                append_event_in_session(
+                    db,
+                    ticket,
+                    "done",
+                    {
+                        "status": "failed",
+                        "message_id": str(ticket.message_id),
+                        "conversation_id": str(ticket.conversation_id),
+                        "retryable": not is_chat,
+                    },
                 )
             else:
                 db.execute(
@@ -282,24 +365,43 @@ def purge_expired_events() -> int:
             purged += int(result.rowcount or 0)
     return purged
 
-def append_event(ticket: QueueTicket, event: str, data: dict[str, Any]) -> None:
+def append_event_in_session(
+    db: Session,
+    ticket: QueueTicket,
+    event: str,
+    data: dict[str, Any],
+) -> None:
+    """在调用方事务内写事件。
+
+    ``run_id`` 必须落库：同一 message 重试时会有多次尝试，只按 message_id
+    读会把两次尝试的事件混在一起，``after_seq`` 游标随之失效。
+    """
     payload = json.dumps(data, ensure_ascii=False, default=str)
+    db.execute(
+        text(
+            "insert into session_events "
+            "(tenant_id, user_id, conversation_id, message_id, run_id, event, data) "
+            "values (:tenant_id, :user_id, :conversation_id, :message_id, :run_id,"
+            " :event, cast(:data as jsonb))"
+        ),
+        {
+            "tenant_id": str(ticket.tenant_id),
+            "user_id": str(ticket.user_id),
+            "conversation_id": str(ticket.conversation_id),
+            "message_id": str(ticket.message_id),
+            "run_id": str(ticket.run_id),
+            "event": event,
+            "data": payload,
+        },
+    )
+    db.execute(
+        text("update chat_runs set last_seq = last_seq + 1 where id = :id"),
+        {"id": str(ticket.run_id)},
+    )
+
+def append_event(ticket: QueueTicket, event: str, data: dict[str, Any]) -> None:
     with tenant_scope(ticket.tenant_id, ticket.user_id) as db:
-        db.execute(
-            text(
-                "insert into session_events "
-                "(tenant_id, user_id, conversation_id, message_id, event, data) "
-                "values (:tenant_id, :user_id, :conversation_id, :message_id, :event, cast(:data as jsonb))"
-            ),
-            {
-                "tenant_id": str(ticket.tenant_id),
-                "user_id": str(ticket.user_id),
-                "conversation_id": str(ticket.conversation_id),
-                "message_id": str(ticket.message_id),
-                "event": event,
-                "data": payload,
-            },
-        )
+        append_event_in_session(db, ticket, event, data)
 
 def read_events(
     tenant_id: uuid.UUID,
@@ -327,6 +429,119 @@ def read_events(
                 data = {"raw": data}
         result.append({"id": int(row["id"]), "event": row["event"], "data": data or {}})
     return result
+
+def read_events_by_run(
+    tenant_id: uuid.UUID,
+    user_id: uuid.UUID,
+    run_id: uuid.UUID,
+    after_id: int,
+    limit: int = 500,
+) -> list[dict[str, Any]]:
+    """按 run 读事件。
+
+    必须带 run_id：同一 message 重试时会有多次尝试，只按 message_id 读
+    会把两次尝试的事件混在一起，``after_seq`` 游标随之失效。
+    """
+    with tenant_scope(tenant_id, user_id) as db:
+        rows = db.execute(
+            text(
+                "select id, event, data from session_events"
+                " where run_id = :run_id and id > :after"
+                " order by id limit :limit"
+            ),
+            {"run_id": str(run_id), "after": int(after_id), "limit": int(limit)},
+        ).mappings().all()
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        data = row["data"]
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except json.JSONDecodeError:
+                data = {"raw": data}
+        result.append({"id": int(row["id"]), "event": row["event"], "data": data or {}})
+    return result
+
+def load_run(
+    tenant_id: uuid.UUID,
+    user_id: uuid.UUID,
+    run_id: uuid.UUID,
+) -> dict[str, Any] | None:
+    """按 run_id 取回放所需的元信息。"""
+    with session_scope() as db:
+        row = db.execute(
+            text(
+                "select id, message_id, conversation_id, run_type, status, attempt"
+                "  from chat_runs"
+                " where id = :id and tenant_id = :tenant_id and user_id = :user_id"
+            ),
+            {"id": str(run_id), "tenant_id": str(tenant_id), "user_id": str(user_id)},
+        ).mappings().first()
+    return dict(row) if row is not None else None
+
+def last_snapshot(
+    tenant_id: uuid.UUID,
+    user_id: uuid.UUID,
+    run_id: uuid.UUID,
+) -> dict[str, Any] | None:
+    """该 run 最后一条 snapshot 事件。"""
+    with tenant_scope(tenant_id, user_id) as db:
+        row = db.execute(
+            text(
+                "select id, event, data from session_events"
+                " where run_id = :run_id and event = 'snapshot'"
+                " order by id desc limit 1"
+            ),
+            {"run_id": str(run_id)},
+        ).mappings().first()
+    if row is None:
+        return None
+    data = row["data"]
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except json.JSONDecodeError:
+            data = {"raw": data}
+    return {"id": int(row["id"]), "event": row["event"], "data": data or {}}
+
+def run_state(
+    tenant_id: uuid.UUID,
+    user_id: uuid.UUID,
+    run_id: uuid.UUID,
+) -> str | None:
+    """该 run 的当前状态。"""
+    with session_scope() as db:
+        row = db.execute(
+            text(
+                "select status from chat_runs"
+                " where id = :id and tenant_id = :tenant_id and user_id = :user_id"
+            ),
+            {"id": str(run_id), "tenant_id": str(tenant_id), "user_id": str(user_id)},
+        ).fetchone()
+    return str(row[0]) if row is not None else None
+
+def latest_run_for_message(
+    tenant_id: uuid.UUID,
+    user_id: uuid.UUID,
+    message_id: uuid.UUID,
+) -> dict[str, Any] | None:
+    """该消息最新一次尝试的 run（重试后指向新 run）。"""
+    with session_scope() as db:
+        row = db.execute(
+            text(
+                "select id, message_id, conversation_id, run_type, status, attempt"
+                "  from chat_runs"
+                " where message_id = :message_id"
+                "   and tenant_id = :tenant_id and user_id = :user_id"
+                " order by created_at desc limit 1"
+            ),
+            {
+                "message_id": str(message_id),
+                "tenant_id": str(tenant_id),
+                "user_id": str(user_id),
+            },
+        ).mappings().first()
+    return dict(row) if row is not None else None
 
 def research_target(
     tenant_id: uuid.UUID,

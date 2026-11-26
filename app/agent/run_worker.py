@@ -21,6 +21,7 @@ from app.agent.run_queue import (
     finish,
     mark_events_expiring,
     purge_expired_events,
+    renew_lease,
     run_status,
     sweep,
     sweep_orphan_messages,
@@ -36,6 +37,8 @@ ORPHAN_SWEEP_INTERVAL_SECONDS = 60.0
 EVENT_PURGE_INTERVAL_SECONDS = 600.0
 # 真流式下 delta 很密，落事件表前合并成小块，避免一轮产生上千行。
 _DELTA_FLUSH_CHARS = 200
+# chat 快照间隔：刷新最多丢这么多字符的生成过程
+_SNAPSHOT_INTERVAL_SECONDS = 0.2
 
 def _next_event(iterator: Any) -> Any:
     try:
@@ -107,67 +110,94 @@ def load_chat_run(ticket: QueueTicket, settings: Settings | None = None) -> Chat
         )
 
 class RunWorker:
-    """单进程内的 durable queue worker；多实例靠 SKIP LOCKED 协作。"""
+    """单进程内的 durable queue worker；多实例靠 SKIP LOCKED 协作。
+
+    分两组协程消费：chat 快进快出、research 长跑。两组额度独立，
+    一个 40 分钟的深度研究占满自己的槽，不会挡住普通聊天。
+    """
 
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
         self.worker_id = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
-        self._task: asyncio.Task[None] | None = None
+        self._tasks: list[asyncio.Task[None]] = []
         self._stopping = asyncio.Event()
 
     async def start(self) -> None:
-        if self._task is not None:
+        if self._tasks:
             return
-        self._task = asyncio.create_task(self._loop(), name="chat-run-worker")
-        logger.info("run worker started: %s", self.worker_id)
+        chat_n = max(1, int(self.settings.chat_concurrency))
+        research_n = max(1, int(self.settings.research_concurrency))
+        for i in range(chat_n):
+            self._tasks.append(
+                asyncio.create_task(self._loop("chat"), name=f"worker-chat-{i}")
+            )
+        for i in range(research_n):
+            self._tasks.append(
+                asyncio.create_task(self._loop("research"), name=f"worker-research-{i}")
+            )
+        logger.info(
+            "run worker started: %s (chat=%s research=%s)",
+            self.worker_id,
+            chat_n,
+            research_n,
+        )
 
     async def stop(self) -> None:
         self._stopping.set()
-        if self._task is None:
-            return
-        self._task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await self._task
-        self._task = None
+        for task in self._tasks:
+            task.cancel()
+        for task in self._tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        self._tasks = []
         logger.info("run worker stopped: %s", self.worker_id)
 
     async def _sleep(self, seconds: float) -> None:
         with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(self._stopping.wait(), timeout=max(0.05, seconds))
 
-    async def _loop(self) -> None:
+    async def _loop(self, run_type: str) -> None:
+        # 维护类任务只让 chat 组的第 0 个协程做，避免 N 个协程重复扫库。
+        is_maintenance = run_type == "chat" and asyncio.current_task() is self._tasks[0]
         last_orphan_sweep = 0.0
         last_event_purge = 0.0
         while not self._stopping.is_set():
             try:
-                recovered = await asyncio.to_thread(sweep, self.settings.run_max_attempts)
-                for ticket, state in recovered:
-                    logger.warning(
-                        "run %s recovered by lease sweep (attempt=%s, state=%s)",
-                        ticket.run_id,
-                        ticket.attempt,
-                        state,
+                if is_maintenance:
+                    recovered = await asyncio.to_thread(
+                        sweep, self.settings.run_max_attempts
                     )
+                    for ticket, state in recovered:
+                        logger.warning(
+                            "run %s recovered by lease sweep (type=%s attempt=%s state=%s)",
+                            ticket.run_id,
+                            ticket.run_type,
+                            ticket.attempt,
+                            state,
+                        )
 
-                now = time.monotonic()
-                if now - last_orphan_sweep >= ORPHAN_SWEEP_INTERVAL_SECONDS:
-                    last_orphan_sweep = now
-                    orphans = await asyncio.to_thread(
-                        sweep_orphan_messages,
-                        self.settings.orphan_sweep_seconds,
-                    )
-                    if orphans:
-                        logger.warning("marked %s orphan chat message(s) as failed", orphans)
-                if now - last_event_purge >= EVENT_PURGE_INTERVAL_SECONDS:
-                    last_event_purge = now
-                    purged = await asyncio.to_thread(purge_expired_events)
-                    if purged:
-                        logger.info("purged %s expired session event(s)", purged)
+                    now = time.monotonic()
+                    if now - last_orphan_sweep >= ORPHAN_SWEEP_INTERVAL_SECONDS:
+                        last_orphan_sweep = now
+                        orphans = await asyncio.to_thread(
+                            sweep_orphan_messages,
+                            self.settings.orphan_sweep_seconds,
+                        )
+                        if orphans:
+                            logger.warning(
+                                "marked %s orphan chat message(s) as failed", orphans
+                            )
+                    if now - last_event_purge >= EVENT_PURGE_INTERVAL_SECONDS:
+                        last_event_purge = now
+                        purged = await asyncio.to_thread(purge_expired_events)
+                        if purged:
+                            logger.info("purged %s expired session event(s)", purged)
 
                 ticket = await asyncio.to_thread(
                     claim,
                     self.worker_id,
                     self.settings.run_lease_seconds,
+                    run_type,
                 )
                 if ticket is None:
                     await self._sleep(self.settings.run_queue_poll_seconds)
@@ -176,10 +206,22 @@ class RunWorker:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.exception("run worker loop failed")
+                logger.exception("run worker loop failed (%s)", run_type)
                 await self._sleep(1.0)
 
     async def _execute(self, ticket: QueueTicket) -> None:
+        """执行一条任务；期间维持心跳续租，退出时确保心跳被取消。"""
+        heartbeat = asyncio.create_task(
+            self._heartbeat(ticket), name=f"heartbeat-{ticket.run_id}"
+        )
+        try:
+            await self._execute_inner(ticket)
+        finally:
+            heartbeat.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat
+
+    async def _execute_inner(self, ticket: QueueTicket) -> None:
         run = await asyncio.to_thread(load_chat_run, ticket, self.settings)
         if run is None:
             await asyncio.to_thread(
@@ -192,6 +234,11 @@ class RunWorker:
         run_finalized = False
         pending: list[str] = []
         pending_chars = 0
+        # chat 路径每 200ms 落一条 snapshot（全文），刷新时只读最后一条就能恢复；
+        # research 逐条写 delta/工具事件，因为中间步骤不能丢。
+        is_chat = ticket.run_type == "chat"
+        accumulated: list[str] = []
+        last_snapshot_at = 0.0
 
         async def flush_delta() -> None:
             nonlocal pending_chars
@@ -202,10 +249,30 @@ class RunWorker:
             pending_chars = 0
             await asyncio.to_thread(append_event, ticket, "delta", {"text": text})
 
+        async def flush_snapshot(force: bool = False) -> None:
+            nonlocal last_snapshot_at
+            if not is_chat or not accumulated:
+                return
+            now = time.monotonic()
+            if not force and now - last_snapshot_at < _SNAPSHOT_INTERVAL_SECONDS:
+                return
+            last_snapshot_at = now
+            await asyncio.to_thread(
+                append_event, ticket, "snapshot", {"text": "".join(accumulated)}
+            )
+
+        # 租约只有 120 秒，长任务必须靠心跳续租，否则会被 sweep 误判崩溃。
+        # 心跳由 _execute 统一启停，这里只管执行。
+
         try:
             async for event, data in self._stream(run, ticket.attempt):
                 if event == "delta":
                     text = str(data.get("text") or "")
+                    accumulated.append(text)
+                    if is_chat:
+                        # chat 不写逐条 delta，只按时间窗写快照
+                        await flush_snapshot()
+                        continue
                     pending.append(text)
                     pending_chars += len(text)
                     if pending_chars >= _DELTA_FLUSH_CHARS:
@@ -214,12 +281,14 @@ class RunWorker:
                 if event == "delta_reset":
                     pending.clear()
                     pending_chars = 0
+                    accumulated.clear()
                 await flush_delta()
                 if event == "done":
                     done = True
                     run_finalized = bool(data.get("run_finalized"))
                 await asyncio.to_thread(append_event, ticket, event, data)
             await flush_delta()
+            await flush_snapshot(force=True)
         except asyncio.CancelledError:
             raise
         except RunFenced:
@@ -302,6 +371,30 @@ class RunWorker:
             )
             return
         await asyncio.to_thread(finish, ticket.run_id, "done")
+
+    async def _heartbeat(self, ticket: QueueTicket) -> None:
+        """执行期间定期续租；续租失败说明 run 已被回收，主动退出。"""
+        lease = float(self.settings.run_lease_seconds)
+        interval = max(5.0, lease / 3)
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                ok = await asyncio.to_thread(
+                    renew_lease,
+                    ticket.run_id,
+                    ticket.worker_id or self.worker_id,
+                    ticket.attempt,
+                    lease,
+                )
+                if not ok:
+                    raise RunFenced()
+        except asyncio.CancelledError:
+            raise
+        except RunFenced:
+            logger.warning("run %s heartbeat lost; another worker owns it", ticket.run_id)
+            raise
+        except Exception:
+            logger.exception("heartbeat failed for run %s", ticket.run_id)
 
     async def _stream(
         self,

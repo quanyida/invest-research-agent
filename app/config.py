@@ -107,6 +107,10 @@ class Settings:
     run_queue_poll_seconds: float
     run_lease_seconds: float
     run_max_attempts: int
+    chat_concurrency: int
+    research_concurrency: int
+    chat_detach_seconds: float
+    research_detach_seconds: float
     event_poll_seconds: float
     event_tail_timeout_seconds: float
     agent_service_url: str
@@ -180,10 +184,14 @@ def get_settings() -> Settings:
         ifind_raw_passthrough=_bool("IFIND_RAW_PASSTHROUGH", True),
         tool_result_limit=_int("TOOL_RESULT_LIMIT", 32000),
         run_worker_enabled=_bool("RUN_WORKER_ENABLED", False),
-        run_queue_poll_seconds=_float("RUN_QUEUE_POLL_SECONDS", 0.2),
-        run_lease_seconds=_float("RUN_LEASE_SECONDS", 900.0),
+        run_queue_poll_seconds=_float("RUN_QUEUE_POLL_SECONDS", 0.05),
+        run_lease_seconds=_float("RUN_LEASE_SECONDS", 120.0),
         run_max_attempts=_int("RUN_MAX_ATTEMPTS", 2),
-        event_poll_seconds=_float("EVENT_POLL_SECONDS", 0.15),
+        chat_concurrency=_int("CHAT_CONCURRENCY", 8),
+        research_concurrency=_int("RESEARCH_CONCURRENCY", 2),
+        chat_detach_seconds=_float("CHAT_DETACH_SECONDS", 30.0),
+        research_detach_seconds=_float("RESEARCH_DETACH_SECONDS", 300.0),
+        event_poll_seconds=_float("EVENT_POLL_SECONDS", 0.05),
         event_tail_timeout_seconds=_float("EVENT_TAIL_TIMEOUT_SECONDS", 600.0),
         agent_service_url=os.getenv("AGENT_SERVICE_URL", "http://127.0.0.1:8001").rstrip("/"),
         chat_timeout_seconds=_float("CHAT_TIMEOUT_SECONDS", 60.0),

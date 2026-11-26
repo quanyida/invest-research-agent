@@ -1458,8 +1458,38 @@
       if (data && typeof data.text === "string") appendDelta(current, data.text);
       return;
     }
+    if (eventName === "snapshot") {
+      // 快照是全文：整体替换，不能追加（重连时可能与已渲染内容重叠）
+      if (!data || typeof data.text !== "string") return;
+      current.content = data.text;
+      current.shown = data.text.length;
+      current.typing = false;
+      if (view) {
+        if (data.text) {
+          view.textNode.classList.remove("answer-empty");
+          view.textNode.classList.add("answer-text");
+          view.textNode.textContent = data.text;
+        } else {
+          view.textNode.classList.add("answer-empty");
+          view.textNode.classList.remove("answer-text");
+        }
+      }
+      setRunProgressPhase(current, "正在组织答案…");
+      scrollBottom();
+      return;
+    }
+    if (eventName === "run_detached") {
+      // 服务端主动断开观战；任务仍在跑，前端改走回放接口。
+      const runId = data && data.run_id;
+      const lastSeq = Number((data && data.last_seq) || 0);
+      setAgentStatus("仍在生成，可离开页面");
+      if (runId) resumeRunStream(runId, lastSeq, current);
+      return;
+    }
     if (eventName === "delta_reset") {
       current.content = "";
+      current.shown = 0;
+      current.typing = false;
       if (view) {
         view.textNode.textContent = "";
         view.textNode.classList.add("answer-empty");
@@ -1494,6 +1524,10 @@
       finishRunProgress(current, current.status);
       if (view) setRowStatus(view, current.status, statusInfo(current.status, current.meta).label);
       setAgentStatus("完成 · " + statusInfo(current.status, current.meta).label);
+      // retryable=false（普通聊天）不自动重试，给一个明确的「重新提问」
+      if (current.status === "failed" && data.retryable === false && view) {
+        renderRetryAction(view, current, "重新提问");
+      }
       return;
     }
     if (eventName === "error") {
@@ -1571,6 +1605,8 @@
     state.currentAssistant = {
       ...pending,
       content: "",
+      shown: 0,
+      typing: false,
       evidence: pending.evidence || [],
       meta: pending.meta || {},
       view: { row, textNode, body, progress },
@@ -1581,13 +1617,61 @@
         applyAgentEvent(eventName, data);
       }, {
         method: "GET",
-        url: "/api/v1/research/" + encodeURIComponent(runId) + "/stream?after=0",
+        url: "/api/v1/runs/" + encodeURIComponent(runId) + "/events?after_seq=0",
       });
       return true;
     } catch (error) {
       state.currentAssistant = null;
       return false;
     }
+  }
+
+  async function resumeRunStream(runId, afterSeq, current) {
+    // 服务端断开观战后接管：从 last_seq 续上，任务本身一直在 worker 里跑。
+    if (!runId || state.streaming) return;
+    stopResearchTimer();
+    try {
+      await streamChat(null, (eventName, data) => {
+        if (state.currentAssistant !== current) return;
+        applyAgentEvent(eventName, data);
+      }, {
+        method: "GET",
+        url: "/api/v1/runs/" + encodeURIComponent(runId) + "/events?after_seq=" + afterSeq,
+      });
+    } catch (error) {
+      // 续接失败就退回轮询，用户仍能看到最终结果
+      if (current && current.id) {
+        pollUntilSettled(state.activeId, current.id, current.created_at, state.pollToken);
+      }
+    }
+  }
+
+  function renderRetryAction(view, current, label) {
+    if (!view || !view.body) return;
+    if (view.body.querySelector(".answer-retry")) return;   // 幂等
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "answer-retry";
+    button.textContent = label || "重新提问";
+    button.addEventListener("click", () => {
+      if (state.streaming) return;
+      const question = lastUserQuestionFor(current);
+      if (question) sendQuestion(question);
+    });
+    view.body.appendChild(button);
+  }
+
+  function lastUserQuestionFor(current) {
+    const messages = state.messages || [];
+    const index = current && current.id
+      ? messages.findIndex((item) => item.id === current.id)
+      : -1;
+    const limit = index >= 0 ? index : messages.length;
+    for (let i = limit - 1; i >= 0; i -= 1) {
+      const item = messages[i];
+      if (item && item.role === "user" && item.content) return item.content;
+    }
+    return "";
   }
 
   async function pollUntilSettled(conversationId, messageId, _startedAt, pollToken) {
@@ -1740,10 +1824,11 @@
     const resume = async () => {
       const current = state.currentAssistant;
       if (!current || !current.id) return false;
-      await streamChat(null, handle, {
-        method: "GET",
-        url: "/api/v1/messages/" + encodeURIComponent(current.id) + "/events?after=" + lastEventId,
-      });
+      const runId = current.meta && current.meta.run_id;
+      const url = runId
+        ? "/api/v1/runs/" + encodeURIComponent(runId) + "/events?after_seq=" + lastEventId
+        : "/api/v1/messages/" + encodeURIComponent(current.id) + "/events?after=" + lastEventId;
+      await streamChat(null, handle, { method: "GET", url });
       return true;
     };
 
@@ -1771,11 +1856,16 @@
         startResearchTimer(view, Date.now());
         await streamChat(null, handle, { method: "GET", url: created.stream_url });
       } else {
-        await streamChat({
-          conversation_id: state.activeId,
-          client_request_id: newRequestId(),
-          message: question,
-        }, handle);
+        // 普通聊天也投队列：POST 返回的是 SSE（服务端观战 30 秒后断开）
+        await streamChat(
+          {
+            conversation_id: state.activeId,
+            client_request_id: newRequestId(),
+            message: question,
+            mode: "chat",
+          },
+          handle,
+        );
       }
       let attempts = 0;
       while (state.currentAssistant && state.currentAssistant.status === "running" && state.currentAssistant.id && attempts < 20) {

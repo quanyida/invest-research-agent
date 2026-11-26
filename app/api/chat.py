@@ -13,7 +13,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, AsyncIterator
 
 import httpx
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select, text
@@ -112,8 +112,13 @@ def _prepare_turn(
     message_id: uuid.UUID,
     *,
     enqueue: bool = True,
+    run_type: str = "research",
 ) -> PreparedTurn:
-    """写 user/assistant 两条消息；research 入队，chat 直接执行。"""
+    """写 user/assistant 两条消息并投队列。
+
+    两条消息与 chat_runs 必须在同一事务：否则撞 ``chat_runs_one_active``
+    回滚时会留下一条孤立的问题。
+    """
     _check_daily_quota(db, principal.user_id)
 
     if body.client_request_id:
@@ -195,7 +200,7 @@ def _prepare_turn(
         role="assistant",
         content="",
         status="queued" if enqueue else "running",
-        meta={} if enqueue else {"mode": "chat"},
+        meta={},
         created_at=created_at + timedelta(microseconds=1),
     )
     db.add(assistant_message)
@@ -211,9 +216,17 @@ def _prepare_turn(
             conversation_id=conversation.id,
             message_id=message_id,
             request_id=request_id,
+            run_type=run_type,
         )
-        # 会话列表靠 meta.run_id 判断能否连事件回放；同步聊天没有 run，只留 mode。
-        assistant_message.meta = {**(assistant_message.meta or {}), "run_id": str(run_id), "queued": True}
+        # 会话列表靠 meta.run_id 判断能否连事件回放。
+        assistant_message.meta = {
+            **(assistant_message.meta or {}),
+            "run_id": str(run_id),
+            "run_type": run_type,
+            "queued": True,
+        }
+    else:
+        assistant_message.meta = {"mode": "chat"}
     return PreparedTurn(
         conversation_id=conversation.id,
         message_id=message_id,
@@ -227,6 +240,7 @@ def _start_turn(
     question: str,
     *,
     enqueue: bool = True,
+    run_type: str = "research",
 ) -> tuple[uuid.UUID, PreparedTurn]:
     request_id = uuid.uuid4()
     message_id = uuid.uuid4()
@@ -240,12 +254,163 @@ def _start_turn(
                 request_id,
                 message_id,
                 enqueue=enqueue,
+                run_type=run_type,
             )
     except IntegrityError as exc:
         if _is_conversation_busy(exc):
             raise _busy_error() from exc
         raise HTTPException(status_code=409, detail={"code": "DUPLICATE_REQUEST", "message": "该请求已提交过"}) from exc
     return request_id, prepared
+
+def _resolve_cursor(after: int, request: Request) -> int:
+    """游标取 ?after 与 Last-Event-ID 的较大值。"""
+    cursor = max(0, int(after))
+    last_event_id = request.headers.get("last-event-id")
+    if last_event_id:
+        try:
+            cursor = max(cursor, int(last_event_id))
+        except ValueError:
+            pass
+    return cursor
+
+async def _replay_run(
+    principal: Any,
+    run: dict[str, Any],
+    cursor: int,
+) -> AsyncIterator[str]:
+    """统一回放：先补历史，再接直播，终态关闭。"""
+    run_id = run["id"]
+    run_type = str(run["run_type"] or "research")
+    yield _sse(
+        "meta",
+        {
+            "run_id": str(run_id),
+            "run_type": run_type,
+            "message_id": str(run["message_id"]),
+            "conversation_id": str(run["conversation_id"]),
+        },
+    )
+
+    # 聊天首帧恢复：只给最后一条快照，避免几百条 delta 逐条重绘。
+    if run_type == "chat" and cursor == 0:
+        snap = await asyncio.to_thread(
+            run_queue.last_snapshot,
+            principal.tenant_id,
+            principal.user_id,
+            run_id,
+        )
+        if snap is not None:
+            cursor = int(snap["id"]) - 1
+
+    async for chunk in _tail_run(principal, run_id, run_type, cursor):
+        yield chunk
+
+async def _tail_run(
+    principal: Any,
+    run_id: uuid.UUID,
+    run_type: str,
+    cursor: int,
+) -> AsyncIterator[str]:
+    """轮询 run 的事件直到终态。"""
+    settings = get_settings()
+    deadline = time.monotonic() + settings.event_tail_timeout_seconds
+    last_keepalive = time.monotonic()
+    terminal = {"done", "error"}
+    try:
+        while True:
+            events = await asyncio.to_thread(
+                run_queue.read_events_by_run,
+                principal.tenant_id,
+                principal.user_id,
+                run_id,
+                cursor,
+            )
+            if events:
+                for item in events:
+                    cursor = item["id"]
+                    yield _sse(item["event"], item["data"], cursor)
+                    if item["event"] in terminal:
+                        return
+                continue
+
+            state = await asyncio.to_thread(
+                run_queue.run_state,
+                principal.tenant_id,
+                principal.user_id,
+                run_id,
+            )
+            if state is None:
+                return
+            if state in {"done", "failed", "cancelled"}:
+                # 终态事件可能还没落库，给一次机会重读
+                events = await asyncio.to_thread(
+                    run_queue.read_events_by_run,
+                    principal.tenant_id,
+                    principal.user_id,
+                    run_id,
+                    cursor,
+                )
+                for item in events:
+                    cursor = item["id"]
+                    yield _sse(item["event"], item["data"], cursor)
+                    if item["event"] in terminal:
+                        return
+                yield _sse(
+                    "done",
+                    {"status": state, "run_id": str(run_id)},
+                )
+                return
+
+            now = time.monotonic()
+            if now >= deadline:
+                logger.info("run tail timeout for %s at cursor %s", run_id, cursor)
+                return
+            if now - last_keepalive >= 10:
+                last_keepalive = now
+                yield ": keepalive\n\n"
+            await asyncio.sleep(settings.event_poll_seconds)
+    except asyncio.CancelledError:
+        raise
+
+async def _watch_run(
+    principal: Any,
+    prepared: PreparedTurn,
+    detach_seconds: float,
+) -> AsyncIterator[str]:
+    """观战一条刚创建的 run；超过阈值就断开，让前端改走回放。"""
+    if prepared.run_id is None:
+        yield _sse("error", {"code": "QUEUE_FAILED", "message": "任务创建失败"})
+        return
+
+    run = await asyncio.to_thread(
+        run_queue.load_run,
+        principal.tenant_id,
+        principal.user_id,
+        prepared.run_id,
+    )
+    if run is None:
+        yield _sse("error", {"code": "RUN_NOT_FOUND", "message": "任务不存在"})
+        return
+
+    started = time.monotonic()
+    last_seq = 0
+    async for chunk in _replay_run(principal, run, 0):
+        # 跟踪最后事件 id，断流时告诉前端从哪续
+        if chunk.startswith("id: "):
+            head = chunk.split("\n", 1)[0][4:]
+            if head.isdigit():
+                last_seq = int(head)
+        yield chunk
+        if time.monotonic() - started > detach_seconds:
+            yield _sse(
+                "run_detached",
+                {
+                    "run_id": str(prepared.run_id),
+                    "last_seq": last_seq,
+                    "stream_url": f"/api/v1/runs/{prepared.run_id}/events",
+                },
+            )
+            return
 
 _AGENT_STALL_SECONDS = 30.0
 _background_tasks: set[asyncio.Task[Any]] = set()
@@ -482,11 +647,13 @@ def chat(body: ChatBody, request: Request) -> StreamingResponse:
     question = _question_of(body)
     _check_rate(principal.user_id)
 
-    _, prepared = _start_turn(principal, body, question, enqueue=False)
+    # 任务从第一毫秒起就不在 HTTP 生命周期里：投队列，worker 执行到底。
+    # HTTP 只是「观战」，30 秒后主动断开让前端改走回放接口。
+    _, prepared = _start_turn(principal, body, question, run_type="chat")
 
     settings = get_settings()
     return StreamingResponse(
-        _proxy_chat(principal, prepared, question, settings),
+        _watch_run(principal, prepared, settings.chat_detach_seconds),
         media_type="text/event-stream",
         headers=_SSE_HEADERS,
     )
@@ -499,49 +666,50 @@ def research(body: ChatBody, request: Request) -> dict[str, Any]:
     question = _question_of(body)
     _check_rate(principal.user_id)
 
-    _, prepared = _start_turn(principal, body, question)
+    _, prepared = _start_turn(principal, body, question, run_type="research")
     return {
         "run_id": str(prepared.run_id),
         "message_id": str(prepared.message_id),
         "conversation_id": str(prepared.conversation_id),
-        "stream_url": f"/api/v1/research/{prepared.run_id}/stream",
+        "stream_url": f"/api/v1/runs/{prepared.run_id}/events",
     }
 
-@router.get("/research/{run_id}/stream")
-def research_stream(run_id: uuid.UUID, request: Request, after: int = 0) -> StreamingResponse:
-    """回放 research 任务事件，支持 ?after 与 Last-Event-ID 续传。"""
+@router.get("/runs/{run_id}/events")
+def run_events(
+    run_id: uuid.UUID,
+    request: Request,
+    after_seq: int = Query(default=0, ge=0),
+) -> StreamingResponse:
+    """统一回放入口：普通聊天与深度研究共用。
+
+    ``run_type='chat'`` 且 ``after_seq=0`` 时只吐最后一条 snapshot，
+    避免逐条重绘；深度研究逐条重放，因为中间步骤不能丢。
+    """
     check_origin(request)
     principal = require_principal(request)
-    cursor = max(0, int(after))
-    last_event_id = request.headers.get("last-event-id")
-    if last_event_id:
-        try:
-            cursor = max(cursor, int(last_event_id))
-        except ValueError:
-            pass
-
-    message_id = run_queue.research_target(principal.tenant_id, principal.user_id, run_id)
-    if message_id is None:
-        raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "任务不存在"})
-
+    cursor = _resolve_cursor(after_seq, request)
+    run = run_queue.load_run(principal.tenant_id, principal.user_id, run_id)
+    if run is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "NOT_FOUND", "message": "任务不存在"},
+        )
     return StreamingResponse(
-        _stream_events(principal.tenant_id, principal.user_id, message_id, cursor),
+        _replay_run(principal, run, cursor),
         media_type="text/event-stream",
         headers=_SSE_HEADERS,
     )
+
+@router.get("/research/{run_id}/stream")
+def research_stream(run_id: uuid.UUID, request: Request, after: int = 0) -> StreamingResponse:
+    """兼容别名：内部转 ``/runs/{run_id}/events``。"""
+    return run_events(run_id, request, after_seq=after)
+
 @router.get("/messages/{message_id}/events")
 def message_events(message_id: uuid.UUID, request: Request, after: int = 0) -> StreamingResponse:
-    """断线重连：从 cursor 之后回放事件，并继续跟随到结束。"""
+    """兼容别名：按 message_id 找到最新 run 后转统一回放。"""
     check_origin(request)
     principal = require_principal(request)
-    cursor = max(0, int(after))
-    last_event_id = request.headers.get("last-event-id")
-    if last_event_id:
-        try:
-            cursor = max(cursor, int(last_event_id))
-        except ValueError:
-            pass
-
     with tenant_scope(principal.tenant_id, principal.user_id) as db:
         found = db.scalar(
             select(Message.id).where(
@@ -550,13 +718,23 @@ def message_events(message_id: uuid.UUID, request: Request, after: int = 0) -> S
             )
         )
     if found is None:
-        raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "消息不存在"})
-
-    return StreamingResponse(
-        _stream_events(principal.tenant_id, principal.user_id, message_id, cursor),
-        media_type="text/event-stream",
-        headers=_SSE_HEADERS,
+        raise HTTPException(
+            status_code=404, detail={"code": "NOT_FOUND", "message": "消息不存在"}
+        )
+    run = run_queue.latest_run_for_message(
+        principal.tenant_id, principal.user_id, message_id
     )
+    if run is None:
+        # 历史同步聊天没有 run，退回按 message_id 读事件。
+        cursor = _resolve_cursor(after, request)
+        return StreamingResponse(
+            _stream_events(
+                principal.tenant_id, principal.user_id, message_id, cursor
+            ),
+            media_type="text/event-stream",
+            headers=_SSE_HEADERS,
+        )
+    return run_events(run["id"], request, after_seq=after)
 
 async def _stream_events(
     tenant_id: uuid.UUID,
