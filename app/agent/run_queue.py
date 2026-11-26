@@ -406,33 +406,6 @@ def append_event(ticket: QueueTicket, event: str, data: dict[str, Any]) -> None:
     with tenant_scope(ticket.tenant_id, ticket.user_id) as db:
         append_event_in_session(db, ticket, event, data)
 
-def read_events(
-    tenant_id: uuid.UUID,
-    user_id: uuid.UUID,
-    message_id: uuid.UUID,
-    after_id: int,
-    limit: int = 200,
-) -> list[dict[str, Any]]:
-    with tenant_scope(tenant_id, user_id) as db:
-        rows = db.execute(
-            text(
-                "select id, event, data from session_events"
-                " where message_id = :message_id and id > :after"
-                " order by id limit :limit"
-            ),
-            {"message_id": str(message_id), "after": int(after_id), "limit": int(limit)},
-        ).mappings().all()
-    result: list[dict[str, Any]] = []
-    for row in rows:
-        data = row["data"]
-        if isinstance(data, str):
-            try:
-                data = json.loads(data)
-            except json.JSONDecodeError:
-                data = {"raw": data}
-        result.append({"id": int(row["id"]), "event": row["event"], "data": data or {}})
-    return result
-
 def read_events_by_run(
     tenant_id: uuid.UUID,
     user_id: uuid.UUID,
@@ -523,54 +496,6 @@ def run_state(
         ).fetchone()
     return str(row[0]) if row is not None else None
 
-def latest_run_for_message(
-    tenant_id: uuid.UUID,
-    user_id: uuid.UUID,
-    message_id: uuid.UUID,
-) -> dict[str, Any] | None:
-    """该消息最新一次尝试的 run（重试后指向新 run）。"""
-    with session_scope() as db:
-        row = db.execute(
-            text(
-                "select id, message_id, conversation_id, run_type, status, attempt"
-                "  from chat_runs"
-                " where message_id = :message_id"
-                "   and tenant_id = :tenant_id and user_id = :user_id"
-                " order by created_at desc limit 1"
-            ),
-            {
-                "message_id": str(message_id),
-                "tenant_id": str(tenant_id),
-                "user_id": str(user_id),
-            },
-        ).mappings().first()
-    return dict(row) if row is not None else None
-
-def research_target(
-    tenant_id: uuid.UUID,
-    user_id: uuid.UUID,
-    run_id: uuid.UUID,
-) -> uuid.UUID | None:
-    """按 run_id 找到 research 任务的助手消息。
-
-    ``chat_runs`` 没有 RLS，必须显式带租户与用户过滤。
-    """
-    with session_scope() as db:
-        value = db.execute(
-            text(
-                "select message_id from chat_runs"
-                " where id = :id and tenant_id = :tenant_id and user_id = :user_id"
-            ),
-            {
-                "id": str(run_id),
-                "tenant_id": str(tenant_id),
-                "user_id": str(user_id),
-            },
-        ).scalar_one_or_none()
-    if value is None:
-        return None
-    return value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
-
 def run_status(tenant_id: uuid.UUID, run_id: uuid.UUID) -> str | None:
     with session_scope() as db:
         return db.execute(
@@ -590,22 +515,3 @@ def active_run_for_message(tenant_id: uuid.UUID, message_id: uuid.UUID) -> Queue
             {"message_id": str(message_id), "tenant_id": str(tenant_id)},
         ).mappings().first()
     return _ticket(row) if row is not None else None
-def message_run_state(
-    tenant_id: uuid.UUID,
-    user_id: uuid.UUID,
-    message_id: uuid.UUID,
-) -> dict[str, Any] | None:
-    """读取某条助手消息最近一次 run 的终态信息，供 SSE 断线重连收尾。"""
-    with tenant_scope(tenant_id, user_id) as db:
-        row = db.execute(
-            text(
-                "select r.status, r.error_code, r.error_message,"
-                "       m.status as message_status"
-                " from chat_runs r"
-                " join messages m on m.tenant_id = r.tenant_id and m.id = r.message_id"
-                " where r.tenant_id = :tenant_id and r.message_id = :message_id"
-                " order by r.created_at desc limit 1"
-            ),
-            {"tenant_id": str(tenant_id), "message_id": str(message_id)},
-        ).mappings().first()
-    return dict(row) if row is not None else None

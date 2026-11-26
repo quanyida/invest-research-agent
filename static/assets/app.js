@@ -1839,10 +1839,15 @@
       const current = state.currentAssistant;
       if (!current || !current.id) return false;
       const runId = current.meta && current.meta.run_id;
-      const url = runId
-        ? "/api/v1/runs/" + encodeURIComponent(runId) + "/events?after_seq=" + lastEventId
-        : "/api/v1/messages/" + encodeURIComponent(current.id) + "/events?after=" + lastEventId;
-      await streamChat(null, handle, { method: "GET", url });
+      if (!runId) {
+        // 改造前的旧消息没有 run_id：没有事件可回放，轮询到终态即可
+        pollUntilSettled(state.activeId, current.id, current.created_at, state.pollToken);
+        return true;
+      }
+      await streamChat(null, handle, {
+        method: "GET",
+        url: "/api/v1/runs/" + encodeURIComponent(runId) + "/events?after_seq=" + lastEventId,
+      });
       return true;
     };
 

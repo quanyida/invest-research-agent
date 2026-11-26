@@ -93,45 +93,23 @@ def test_chat_enqueues_as_chat_type(monkeypatch):
     assert assistant[0].meta["run_type"] == "chat"
     assert assistant[0].meta["run_id"] == str(RUN)
 
-def test_research_stream_rejects_unknown_run(monkeypatch):
-    _patch_request(monkeypatch)
-    monkeypatch.setattr(chat.run_queue, "load_run", lambda *_a, **_k: None)
+def test_only_one_replay_endpoint_remains():
+    """回放入口只保留 /runs/{run_id}/events。
 
-    with pytest.raises(HTTPException) as raised:
-        chat.research_stream(RUN, _Request(), 0)
+    两个兼容别名（/research/{run_id}/stream、/messages/{message_id}/events）
+    已删除：它们和统一入口做同一件事，只是寻址方式不同，留着等于长期
+    维护两套鉴权分支。
+    """
+    paths = {route.path for route in chat.router.routes}
+    assert "/api/v1/runs/{run_id}/events" in paths
+    assert "/api/v1/research/{run_id}/stream" not in paths
+    assert "/api/v1/messages/{message_id}/events" not in paths
 
-    assert raised.value.status_code == 404
-    assert raised.value.detail["code"] == "NOT_FOUND"
 
-def test_research_stream_replays_from_cursor(monkeypatch):
-    _patch_request(monkeypatch)
-    captured: dict[str, object] = {}
-
-    monkeypatch.setattr(
-        chat.run_queue,
-        "load_run",
-        lambda *_a, **_k: {
-            "id": RUN,
-            "message_id": MESSAGE,
-            "conversation_id": UUID("00000000-0000-0000-0000-0000000000cc"),
-            "run_type": "research",
-            "status": "running",
-            "attempt": 1,
-        },
-    )
-
-    def fake_tail(principal, run_id, run_type, cursor):
-        captured.update(run_id=run_id, run_type=run_type, cursor=cursor)
-        return _empty_stream()
-
-    monkeypatch.setattr(chat, "_tail_run", fake_tail)
-
-    response = chat.research_stream(RUN, _Request(headers={"last-event-id": "7"}), 3)
-    assert isinstance(response, StreamingResponse)
-
-    # 游标由 _resolve_cursor 在端点入口算好，这里直接验证它
+def test_cursor_takes_max_of_query_and_header():
     assert chat._resolve_cursor(3, _Request(headers={"last-event-id": "7"})) == 7
     assert chat._resolve_cursor(9, _Request(headers={"last-event-id": "7"})) == 9
+    assert chat._resolve_cursor(0, _Request()) == 0
 
 def test_run_events_rejects_foreign_run(monkeypatch):
     """别人的 run 一律 404，不泄露存在性。"""
