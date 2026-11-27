@@ -289,7 +289,9 @@ async def _replay_run(
         },
     )
 
-    # 聊天首帧恢复：只给最后一条快照，避免几百条 delta 逐条重绘。
+    # 历史 chat run 的首帧恢复：只给最后一条 snapshot，避免重绘几百条 delta。
+    # 新写入的 chat run 只落 delta（不再写全文快照），last_snapshot 返回 None，
+    # 游标保持 0，直接按 delta 顺序回放。
     if run_type == "chat" and cursor == 0:
         snap = await asyncio.to_thread(
             run_queue.last_snapshot,
@@ -452,8 +454,9 @@ def run_events(
 ) -> StreamingResponse:
     """统一回放入口：普通聊天与深度研究共用。
 
-    ``run_type='chat'`` 且 ``after_seq=0`` 时只吐最后一条 snapshot，
-    避免逐条重绘；深度研究逐条重放，因为中间步骤不能丢。
+    ``run_type='chat'`` 且 ``after_seq=0`` 时，如果该 run 还有历史 snapshot
+    （改造前写入的），只从最后一条开始吐，避免逐条重绘；新 run 没有 snapshot，
+    按 delta 顺序回放。深度研究逐条重放，因为中间步骤不能丢。
     """
     check_origin(request)
     principal = require_principal(request)

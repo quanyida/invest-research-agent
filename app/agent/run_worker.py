@@ -17,6 +17,7 @@ from app.agent.persist import RunFenced, mark_assistant_failed
 from app.agent.run_queue import (
     QueueTicket,
     append_event,
+    append_events,
     claim,
     finish,
     mark_events_expiring,
@@ -38,8 +39,9 @@ ORPHAN_SWEEP_INTERVAL_SECONDS = 60.0
 EVENT_PURGE_INTERVAL_SECONDS = 600.0
 # 真流式下 delta 很密，落事件表前合并成小块，避免一轮产生上千行。
 _DELTA_FLUSH_CHARS = 200
-# chat 快照间隔：刷新最多丢这么多字符的生成过程
-_SNAPSHOT_INTERVAL_SECONDS = 0.2
+# 时间阈值：低速生成时也要按这个间隔落一次，否则正文长时间只在内存里，
+# 观战的 SSE 看不到进度，进程被杀时丢的内容也更多。
+_DELTA_FLUSH_INTERVAL_SECONDS = 1.0
 
 def _next_event(iterator: Any) -> Any:
     try:
@@ -280,31 +282,68 @@ class RunWorker:
         run_finalized = False
         pending: list[str] = []
         pending_chars = 0
-        # chat 路径每 200ms 落一条 snapshot（全文），刷新时只读最后一条就能恢复；
-        # research 逐条写 delta/工具事件，因为中间步骤不能丢。
-        is_chat = ticket.run_type == "chat"
-        accumulated: list[str] = []
-        last_snapshot_at = 0.0
+        last_flush_at = time.monotonic()
+        # 重试复用同一个 run_id，上一次尝试的 delta 还留在事件表里。
+        # 第一次真正写事件时顺带落一条 reset，回放才不会把两次文本拼起来；
+        # 若流在写出任何内容前就被 fence，则一条都不写。
+        retry_reset_pending = ticket.attempt > 1
 
-        async def flush_delta() -> None:
+        def take_pending() -> str:
+            """取走缓冲区里的正文；reset 与正常落库都走这里，避免重复清空。"""
             nonlocal pending_chars
-            if not pending:
-                return
             text = "".join(pending)
             pending.clear()
             pending_chars = 0
-            await asyncio.to_thread(append_event, ticket, "delta", {"text": text})
+            return text
 
-        async def flush_snapshot(force: bool = False) -> None:
-            nonlocal last_snapshot_at
-            if not is_chat or not accumulated:
+        def with_retry_reset(
+            items: list[tuple[str, dict[str, Any]]],
+        ) -> list[tuple[str, dict[str, Any]]]:
+            nonlocal retry_reset_pending
+            if not retry_reset_pending:
+                return items
+            retry_reset_pending = False
+            return [("delta_reset", {"reason": "retry"}), *items]
+
+        async def flush_delta(force: bool = False) -> None:
+            """字符数或时间任一达标就落一条合并后的 delta。"""
+            nonlocal last_flush_at
+            if not pending:
                 return
             now = time.monotonic()
-            if not force and now - last_snapshot_at < _SNAPSHOT_INTERVAL_SECONDS:
+            if (
+                not force
+                and pending_chars < _DELTA_FLUSH_CHARS
+                and now - last_flush_at < _DELTA_FLUSH_INTERVAL_SECONDS
+            ):
                 return
-            last_snapshot_at = now
+            text = take_pending()
+            last_flush_at = now
             await asyncio.to_thread(
-                append_event, ticket, "snapshot", {"text": "".join(accumulated)}
+                append_events, ticket, with_retry_reset([("delta", {"text": text})])
+            )
+
+        async def write_event(event: str, data: dict[str, Any]) -> None:
+            """单条关键事件；需要时把重试用的 reset 一起带上（同一事务）。"""
+            if retry_reset_pending:
+                await asyncio.to_thread(
+                    append_events, ticket, with_retry_reset([(event, data)])
+                )
+                return
+            await asyncio.to_thread(append_event, ticket, event, data)
+
+        async def write_after_pending(event: str, data: dict[str, Any]) -> None:
+            """关键事件前先把正文写完；两条塞进同一个事务，顺序由事件 id 保证。"""
+            nonlocal last_flush_at
+            if not pending:
+                await write_event(event, data)
+                return
+            text = take_pending()
+            last_flush_at = time.monotonic()
+            await asyncio.to_thread(
+                append_events,
+                ticket,
+                with_retry_reset([("delta", {"text": text}), (event, data)]),
             )
 
         # 租约只有 120 秒，长任务必须靠心跳续租，否则会被 sweep 误判崩溃。
@@ -314,27 +353,21 @@ class RunWorker:
             async for event, data in self._stream(run, ticket.attempt):
                 if event == "delta":
                     text = str(data.get("text") or "")
-                    accumulated.append(text)
-                    if is_chat:
-                        # chat 不写逐条 delta，只按时间窗写快照
-                        await flush_snapshot()
-                        continue
-                    pending.append(text)
-                    pending_chars += len(text)
-                    if pending_chars >= _DELTA_FLUSH_CHARS:
+                    if text:
+                        pending.append(text)
+                        pending_chars += len(text)
                         await flush_delta()
                     continue
                 if event == "delta_reset":
-                    pending.clear()
-                    pending_chars = 0
-                    accumulated.clear()
-                await flush_delta()
+                    # 模型重开一段（工具调用打断），缓冲区里的旧文本作废
+                    take_pending()
+                    await write_event(event, data)
+                    continue
                 if event == "done":
                     done = True
                     run_finalized = bool(data.get("run_finalized"))
-                await asyncio.to_thread(append_event, ticket, event, data)
-            await flush_delta()
-            await flush_snapshot(force=True)
+                await write_after_pending(event, data)
+            await flush_delta(force=True)
         except asyncio.CancelledError:
             raise
         except RunFenced:
@@ -355,10 +388,10 @@ class RunWorker:
             # 所有权校验在 append_event 里：被接管后第一条写入就被拒绝，
             # 后面的失败标记全部跳过，不会覆盖新持有者的状态。
             try:
-                await asyncio.to_thread(append_event, ticket, "error", error)
-                await asyncio.to_thread(
-                    append_event,
-                    ticket,
+                # 已经生成的半截正文先落库，再报错，用户至少能看到停在哪。
+                await flush_delta(force=True)
+                await write_event("error", error)
+                await write_event(
                     "done",
                     {
                         "status": "error",
@@ -413,9 +446,7 @@ class RunWorker:
             return
         if not done:
             try:
-                await asyncio.to_thread(
-                    append_event,
-                    ticket,
+                await write_event(
                     "done",
                     {
                         "status": "error",

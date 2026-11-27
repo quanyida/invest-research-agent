@@ -4,7 +4,7 @@ import json
 import logging
 import uuid
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Sequence
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -426,15 +426,14 @@ def purge_expired_events() -> int:
             purged += int(result.rowcount or 0)
     return purged
 
-def append_event_in_session(
+def append_events_in_session(
     db: Session,
     ticket: QueueTicket,
-    event: str,
-    data: dict[str, Any],
+    items: Sequence[tuple[str, dict[str, Any]]],
     *,
     fenced: bool = True,
 ) -> None:
-    """在调用方事务内写事件。
+    """在调用方事务内批量写事件（一条 INSERT，多个 VALUES）。
 
     ``run_id`` 必须落库：同一 message 重试时会有多次尝试，只按 message_id
     读会把两次尝试的事件混在一起，``after_seq`` 游标随之失效。
@@ -443,25 +442,39 @@ def append_event_in_session(
     Worker 接管后，旧 Worker 写不进任何一行，并抛 ``RunFenced``。
     租约回收（``sweep``）写收尾事件时传 ``fenced=False``——它在同一个事务
     里刚把 ``worker_id`` 清空，所有权由那条 update 的 rowcount 保证。
+
+    ``id`` 由 bigserial 按 VALUES 顺序取值，批内递增；回放按 id 排序，
+    因此批内顺序与调用方给出的顺序一致。
     """
-    payload = json.dumps(data, ensure_ascii=False, default=str)
-    params = {
+    if not items:
+        return
+    params: dict[str, Any] = {
         "tenant_id": str(ticket.tenant_id),
         "user_id": str(ticket.user_id),
         "conversation_id": str(ticket.conversation_id),
         "message_id": str(ticket.message_id),
         "run_id": str(ticket.run_id),
-        "event": event,
-        "data": payload,
     }
+    for index, (event, data) in enumerate(items):
+        params[f"event{index}"] = event
+        params[f"data{index}"] = json.dumps(data, ensure_ascii=False, default=str)
+    values = ", ".join(
+        f"(cast(:event{index} as text), cast(:data{index} as text))"
+        for index in range(len(items))
+    )
+    head = (
+        "insert into session_events "
+        "(tenant_id, user_id, conversation_id, message_id, run_id, event, data) "
+        "select cast(:tenant_id as uuid), cast(:user_id as uuid),"
+        " cast(:conversation_id as uuid), cast(:message_id as uuid),"
+        " cast(:run_id as uuid), v.event, cast(v.data as jsonb)"
+        f" from (values {values}) as v(event, data)"
+    )
     if fenced and ticket.worker_id is not None:
         result = db.execute(
             text(
-                "insert into session_events "
-                "(tenant_id, user_id, conversation_id, message_id, run_id, event, data) "
-                "select :tenant_id, :user_id, :conversation_id, :message_id, :run_id,"
-                " :event, cast(:data as jsonb)"
-                " where exists ("
+                head
+                + " where exists ("
                 "   select 1 from chat_runs"
                 "    where id = :run_id"
                 "      and worker_id = :worker_id"
@@ -470,24 +483,38 @@ def append_event_in_session(
             ),
             {**params, "worker_id": ticket.worker_id, "attempt": int(ticket.attempt)},
         )
-        if int(result.rowcount or 0) != 1:
+        if int(result.rowcount or 0) != len(items):
             raise RunFenced(
                 f"run {ticket.run_id} is no longer owned by {ticket.worker_id}"
             )
         return
-    db.execute(
-        text(
-            "insert into session_events "
-            "(tenant_id, user_id, conversation_id, message_id, run_id, event, data) "
-            "values (:tenant_id, :user_id, :conversation_id, :message_id, :run_id,"
-            " :event, cast(:data as jsonb))"
-        ),
-        params,
-    )
+    result = db.execute(text(head), params)
+    if int(result.rowcount or 0) != len(items):
+        # 少写一行就是数据丢失，必须让调用方看到，不能静默吞掉。
+        raise RuntimeError(
+            f"append_events wrote {result.rowcount} of {len(items)} session_events"
+        )
+
+def append_events(
+    ticket: QueueTicket,
+    items: Sequence[tuple[str, dict[str, Any]]],
+) -> None:
+    with tenant_scope(ticket.tenant_id, ticket.user_id) as db:
+        append_events_in_session(db, ticket, items)
+
+def append_event_in_session(
+    db: Session,
+    ticket: QueueTicket,
+    event: str,
+    data: dict[str, Any],
+    *,
+    fenced: bool = True,
+) -> None:
+    """单条事件的兼容入口；内部仍走批量 INSERT，只发一条 SQL。"""
+    append_events_in_session(db, ticket, [(event, data)], fenced=fenced)
 
 def append_event(ticket: QueueTicket, event: str, data: dict[str, Any]) -> None:
-    with tenant_scope(ticket.tenant_id, ticket.user_id) as db:
-        append_event_in_session(db, ticket, event, data)
+    append_events(ticket, [(event, data)])
 
 def read_events_by_run(
     tenant_id: uuid.UUID,
