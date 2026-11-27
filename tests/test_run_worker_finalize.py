@@ -40,7 +40,7 @@ def _patch_common(monkeypatch):
     monkeypatch.setattr(
         run_worker,
         "mark_assistant_failed",
-        lambda *args: marks.append(args),
+        lambda *args, **kwargs: marks.append(args),
     )
     monkeypatch.setattr(
         run_worker,

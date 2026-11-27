@@ -109,7 +109,7 @@ def test_worker_error_path_writes_both_events(monkeypatch):
         run_worker, "append_event", lambda t, e, d: events.append((e, d))
     )
     monkeypatch.setattr(
-        run_worker, "mark_assistant_failed", lambda *a: marks.append(a)
+        run_worker, "mark_assistant_failed", lambda *a, **k: marks.append(a)
     )
     monkeypatch.setattr(run_worker, "mark_events_expiring", lambda *a, **k: 0)
     monkeypatch.setattr(run_worker, "finish", lambda *a, **k: None)
@@ -151,7 +151,7 @@ def test_failure_events_do_not_branch_on_error_kind(monkeypatch, run_type):
     monkeypatch.setattr(
         run_worker, "append_event", lambda t, e, d: events.append((e, d))
     )
-    monkeypatch.setattr(run_worker, "mark_assistant_failed", lambda *a: None)
+    monkeypatch.setattr(run_worker, "mark_assistant_failed", lambda *a, **k: None)
     monkeypatch.setattr(run_worker, "mark_events_expiring", lambda *a, **k: 0)
     monkeypatch.setattr(run_worker, "finish", lambda *a, **k: None)
     monkeypatch.setattr(run_worker, "run_status", lambda *a, **k: "running")

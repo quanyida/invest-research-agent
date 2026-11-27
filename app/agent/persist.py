@@ -370,10 +370,38 @@ def mark_assistant_failed(
     status: str,
     code: str,
     message: str,
+    *,
+    run_id: uuid.UUID | None = None,
+    worker_id: str | None = None,
+    attempt: int | None = None,
 ) -> bool:
-    """把仍处于 running 的助手消息标记为失败，避免重启后留僵尸。"""
+    """把仍处于 running 的助手消息标记为失败，避免重启后留僵尸。
+
+    带 run fencing 时先确认自己仍是持有者：被接管的旧 Worker
+    不能把新持有者正在跑的消息改成失败。
+    """
     try:
         with tenant_scope(tenant_id, user_id) as db:
+            if run_id is not None and worker_id is not None and attempt is not None:
+                owned = db.execute(
+                    text(
+                        "select 1 from chat_runs"
+                        " where id = :id and worker_id = :worker_id"
+                        "   and attempt = :attempt and status = 'running'"
+                    ),
+                    {
+                        "id": str(run_id),
+                        "worker_id": worker_id,
+                        "attempt": int(attempt),
+                    },
+                ).first()
+                if owned is None:
+                    logger.warning(
+                        "run %s no longer owned by %s; skip failed mark",
+                        run_id,
+                        worker_id,
+                    )
+                    return False
             return mark_assistant_failed_in_session(
                 db, message_id, status, code, message
             )

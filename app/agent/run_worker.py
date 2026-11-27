@@ -20,6 +20,7 @@ from app.agent.run_queue import (
     claim,
     finish,
     mark_events_expiring,
+    owns_run,
     purge_expired_events,
     renew_lease,
     run_status,
@@ -45,6 +46,14 @@ def _next_event(iterator: Any) -> Any:
         return next(iterator)
     except StopIteration:
         return _LEGACY_DONE
+
+async def _drain(*tasks: asyncio.Task[Any]) -> None:
+    """取消未结束的子任务并回收，避免悬挂任务与「异常未取回」警告。"""
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 def load_chat_run(ticket: QueueTicket, settings: Settings | None = None) -> ChatRun | None:
     """从数据库还原一轮对话，并把助手消息切到 running。"""
@@ -210,16 +219,53 @@ class RunWorker:
                 await self._sleep(1.0)
 
     async def _execute(self, ticket: QueueTicket) -> None:
-        """执行一条任务；期间维持心跳续租，退出时确保心跳被取消。"""
+        """执行一条任务；心跳与执行互为守卫。
+
+        心跳续租失败意味着任务已被别的 Worker 接管，必须立刻取消执行协程，
+        否则旧 Worker 会继续发起工具调用、继续往同一个 message 写事件。
+        反过来执行先结束时先停心跳，避免它在终态之后续租失败刷告警。
+        """
+        execution = asyncio.create_task(
+            self._execute_inner(ticket), name=f"execute-{ticket.run_id}"
+        )
         heartbeat = asyncio.create_task(
             self._heartbeat(ticket), name=f"heartbeat-{ticket.run_id}"
         )
         try:
-            await self._execute_inner(ticket)
+            waiting: set[asyncio.Task[Any]] = {execution, heartbeat}
+            while True:
+                done, waiting = await asyncio.wait(
+                    waiting, return_when=asyncio.FIRST_COMPLETED
+                )
+                if execution in done:
+                    break
+                exc = None if heartbeat.cancelled() else heartbeat.exception()
+                if exc is None:
+                    # 正常退场：run 已由本 Worker 收尾，等执行写完尾事件即可
+                    continue
+                await _drain(execution)
+                if isinstance(exc, RunFenced):
+                    logger.warning(
+                        "run %s fenced (attempt=%s worker=%s); execution stopped",
+                        ticket.run_id,
+                        ticket.attempt,
+                        ticket.worker_id,
+                    )
+                    return
+                raise exc
+        except asyncio.CancelledError:
+            # 外部取消：两个子任务都要收掉，原样抛出，不伪装成 RunFenced。
+            await _drain(execution, heartbeat)
+            raise
         finally:
-            heartbeat.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await heartbeat
+            await _drain(heartbeat)
+            if not execution.done():
+                await _drain(execution)
+
+        if not execution.cancelled():
+            exc = execution.exception()
+            if exc is not None:
+                raise exc
 
     async def _execute_inner(self, ticket: QueueTicket) -> None:
         run = await asyncio.to_thread(load_chat_run, ticket, self.settings)
@@ -306,98 +352,164 @@ class RunWorker:
                 "code": type(exc).__name__,
                 "message": "回答生成失败，请重新提问。",
             }
-            await asyncio.to_thread(append_event, ticket, "error", error)
-            await asyncio.to_thread(
-                append_event,
-                ticket,
-                "done",
-                {
-                    "status": "error",
-                    "message_id": str(ticket.message_id),
-                    "conversation_id": str(ticket.conversation_id),
-                    "request_id": str(ticket.request_id),
-                },
-            )
-            await asyncio.to_thread(
-                mark_assistant_failed,
-                ticket.tenant_id,
-                ticket.user_id,
-                ticket.message_id,
-                "error",
-                type(exc).__name__,
-                "回答生成失败，请重新提问。",
-            )
-            await asyncio.to_thread(
-                mark_events_expiring, ticket.tenant_id, ticket.user_id, ticket.message_id
-            )
-            await asyncio.to_thread(
-                finish, ticket.run_id, "failed",
-                error_code=type(exc).__name__, error_message=str(exc),
-            )
+            # 所有权校验在 append_event 里：被接管后第一条写入就被拒绝，
+            # 后面的失败标记全部跳过，不会覆盖新持有者的状态。
+            try:
+                await asyncio.to_thread(append_event, ticket, "error", error)
+                await asyncio.to_thread(
+                    append_event,
+                    ticket,
+                    "done",
+                    {
+                        "status": "error",
+                        "message_id": str(ticket.message_id),
+                        "conversation_id": str(ticket.conversation_id),
+                        "request_id": str(ticket.request_id),
+                    },
+                )
+                await asyncio.to_thread(
+                    mark_assistant_failed,
+                    ticket.tenant_id,
+                    ticket.user_id,
+                    ticket.message_id,
+                    "error",
+                    type(exc).__name__,
+                    "回答生成失败，请重新提问。",
+                    run_id=ticket.run_id,
+                    worker_id=ticket.worker_id,
+                    attempt=ticket.attempt,
+                )
+                await asyncio.to_thread(
+                    mark_events_expiring,
+                    ticket.tenant_id,
+                    ticket.user_id,
+                    ticket.message_id,
+                    run_id=ticket.run_id,
+                    worker_id=ticket.worker_id,
+                    attempt=ticket.attempt,
+                )
+                await asyncio.to_thread(
+                    finish, ticket.run_id, "failed",
+                    error_code=type(exc).__name__, error_message=str(exc),
+                    worker_id=ticket.worker_id, attempt=ticket.attempt,
+                )
+            except RunFenced:
+                logger.warning(
+                    "run %s lost ownership while failing; new owner keeps its state",
+                    ticket.run_id,
+                )
             return
 
         await asyncio.to_thread(
-            mark_events_expiring, ticket.tenant_id, ticket.user_id, ticket.message_id
+            mark_events_expiring,
+            ticket.tenant_id,
+            ticket.user_id,
+            ticket.message_id,
+            run_id=ticket.run_id,
+            worker_id=ticket.worker_id,
+            attempt=ticket.attempt,
         )
         if run_finalized:
             return
         if not done:
-            await asyncio.to_thread(
-                append_event,
-                ticket,
-                "done",
-                {
-                    "status": "error",
-                    "message_id": str(ticket.message_id),
-                    "conversation_id": str(ticket.conversation_id),
-                    "request_id": str(ticket.request_id),
-                },
-            )
-            await asyncio.to_thread(
-                mark_assistant_failed,
-                ticket.tenant_id,
-                ticket.user_id,
-                ticket.message_id,
-                "error",
-                "PERSIST_FAILED",
-                "回答保存失败，请重新提问。",
-            )
-            await asyncio.to_thread(
-                mark_events_expiring, ticket.tenant_id, ticket.user_id, ticket.message_id
-            )
-            await asyncio.to_thread(
-                finish,
-                ticket.run_id,
-                "failed",
-                error_code="PERSIST_FAILED",
-                error_message="turn persistence did not complete",
-            )
+            try:
+                await asyncio.to_thread(
+                    append_event,
+                    ticket,
+                    "done",
+                    {
+                        "status": "error",
+                        "message_id": str(ticket.message_id),
+                        "conversation_id": str(ticket.conversation_id),
+                        "request_id": str(ticket.request_id),
+                    },
+                )
+                await asyncio.to_thread(
+                    mark_assistant_failed,
+                    ticket.tenant_id,
+                    ticket.user_id,
+                    ticket.message_id,
+                    "error",
+                    "PERSIST_FAILED",
+                    "回答保存失败，请重新提问。",
+                    run_id=ticket.run_id,
+                    worker_id=ticket.worker_id,
+                    attempt=ticket.attempt,
+                )
+                await asyncio.to_thread(
+                    mark_events_expiring,
+                    ticket.tenant_id,
+                    ticket.user_id,
+                    ticket.message_id,
+                    run_id=ticket.run_id,
+                    worker_id=ticket.worker_id,
+                    attempt=ticket.attempt,
+                )
+                await asyncio.to_thread(
+                    finish,
+                    ticket.run_id,
+                    "failed",
+                    error_code="PERSIST_FAILED",
+                    error_message="turn persistence did not complete",
+                    worker_id=ticket.worker_id,
+                    attempt=ticket.attempt,
+                )
+            except RunFenced:
+                logger.warning(
+                    "run %s lost ownership before finalize; new owner keeps its state",
+                    ticket.run_id,
+                )
             return
-        await asyncio.to_thread(finish, ticket.run_id, "done")
+        await asyncio.to_thread(
+            finish,
+            ticket.run_id,
+            "done",
+            worker_id=ticket.worker_id,
+            attempt=ticket.attempt,
+        )
 
     async def _heartbeat(self, ticket: QueueTicket) -> None:
-        """执行期间定期续租；续租失败说明 run 已被回收，主动退出。"""
+        """执行期间定期续租；续租失败说明 run 已被回收，主动退出。
+
+        只有 RunFenced 会终止心跳。偶发的数据库错误不能停掉续租循环，
+        否则一次抖动就会让活着的 Worker 被 sweep 误判成崩溃；而 run 已经
+        由本 Worker 收尾（不再是 running）属于正常退场，返回即可。
+        """
         lease = float(self.settings.run_lease_seconds)
         interval = max(5.0, lease / 3)
-        try:
-            while True:
-                await asyncio.sleep(interval)
+        worker_id = ticket.worker_id or self.worker_id
+        while True:
+            await asyncio.sleep(interval)
+            try:
                 ok = await asyncio.to_thread(
                     renew_lease,
                     ticket.run_id,
-                    ticket.worker_id or self.worker_id,
+                    worker_id,
                     ticket.attempt,
                     lease,
                 )
-                if not ok:
-                    raise RunFenced()
-        except asyncio.CancelledError:
-            raise
-        except RunFenced:
-            logger.warning("run %s heartbeat lost; another worker owns it", ticket.run_id)
-            raise
-        except Exception:
-            logger.exception("heartbeat failed for run %s", ticket.run_id)
+                if ok:
+                    continue
+                if await asyncio.to_thread(
+                    owns_run, ticket.run_id, worker_id, ticket.attempt
+                ):
+                    logger.info(
+                        "run %s already finalized by this worker; heartbeat stops",
+                        ticket.run_id,
+                    )
+                    return
+                raise RunFenced(
+                    f"run {ticket.run_id} is no longer owned by {worker_id}"
+                )
+            except asyncio.CancelledError:
+                raise
+            except RunFenced:
+                logger.warning(
+                    "run %s heartbeat lost; another worker owns it", ticket.run_id
+                )
+                raise
+            except Exception:
+                logger.exception("heartbeat failed for run %s; retrying", ticket.run_id)
 
     async def _stream(
         self,

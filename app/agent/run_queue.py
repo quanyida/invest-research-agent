@@ -9,7 +9,11 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from app.agent.persist import failed_message_payload, mark_assistant_failed_in_session
+from app.agent.persist import (
+    RunFenced,
+    failed_message_payload,
+    mark_assistant_failed_in_session,
+)
 from app.db import session_scope, tenant_scope
 
 logger = logging.getLogger(__name__)
@@ -156,15 +160,49 @@ def renew_lease(
         )
         return int(result.rowcount or 0) == 1
 
+def owns_run(run_id: uuid.UUID, worker_id: str, attempt: int) -> bool:
+    """当前 Worker 是否仍持有这条 run（不看状态，只看归属）。
+
+    用来区分「租约被别人拿走」和「run 已由自己收尾」：后者 ``renew_lease``
+    同样会失败，但不需要触发 fencing。
+    """
+    with session_scope() as db:
+        row = db.execute(
+            text(
+                "select 1 from chat_runs"
+                " where id = :id and worker_id = :worker_id and attempt = :attempt"
+            ),
+            {"id": str(run_id), "worker_id": worker_id, "attempt": int(attempt)},
+        ).first()
+    return row is not None
+
 def finish(
     run_id: uuid.UUID,
     status: str,
     *,
     error_code: str | None = None,
     error_message: str | None = None,
-) -> None:
+    worker_id: str | None = None,
+    attempt: int | None = None,
+) -> bool:
+    """把 run 落到终态；带 worker_id/attempt 时只有持有者能写。
+
+    返回是否真的写入了一行。被接管的旧 Worker 传了 fencing 参数后
+    只会得到 ``False``，不会把新持有者的任务改成 failed/done。
+    """
+    fence = ""
+    params = {
+        "id": str(run_id),
+        "status": status,
+        "code": error_code,
+        "message": (error_message or "")[:1000] or None,
+    }
+    if worker_id is not None and attempt is not None:
+        fence = " and worker_id = :worker_id and attempt = :attempt"
+        params["worker_id"] = worker_id
+        params["attempt"] = int(attempt)
     with session_scope() as db:
-        db.execute(
+        result = db.execute(
             text(
                 "update chat_runs"
                 "   set status = :status,"
@@ -172,15 +210,11 @@ def finish(
                 "       lease_until = null,"
                 "       error_code = :code,"
                 "       error_message = :message"
-                " where id = :id and status = 'running'"
+                " where id = :id and status = 'running'" + fence
             ),
-            {
-                "id": str(run_id),
-                "status": status,
-                "code": error_code,
-                "message": (error_message or "")[:1000] or None,
-            },
+            params,
         )
+        return int(result.rowcount or 0) == 1
 
 def sweep(max_attempts: int) -> list[tuple[QueueTicket, str]]:
     """回收租约过期的 running 任务：未超次数回队列，超次数判失败。
@@ -261,7 +295,11 @@ def sweep(max_attempts: int) -> list[tuple[QueueTicket, str]]:
                 # 同一事务补两条事件：观战中的前端靠它立刻收尾，
                 # 否则要等 EVENT_TAIL_TIMEOUT_SECONDS（600 秒）才断开。
                 append_event_in_session(
-                    db, ticket, "error", {"code": code, "message": message}
+                    db,
+                    ticket,
+                    "error",
+                    {"code": code, "message": message},
+                    fenced=False,
                 )
                 append_event_in_session(
                     db,
@@ -272,6 +310,7 @@ def sweep(max_attempts: int) -> list[tuple[QueueTicket, str]]:
                         "message_id": str(ticket.message_id),
                         "conversation_id": str(ticket.conversation_id),
                     },
+                    fenced=False,
                 )
             else:
                 db.execute(
@@ -341,20 +380,39 @@ def mark_events_expiring(
     user_id: uuid.UUID,
     message_id: uuid.UUID,
     hours: int = 24,
+    *,
+    run_id: uuid.UUID | None = None,
+    worker_id: str | None = None,
+    attempt: int | None = None,
 ) -> int:
     """任务终态后给回放事件打上过期时间。
 
     落库时已标一次，但部分事件（usage/done 等）在 persist 之后才写入，
-    这里在流结束后补齐。
+    这里在流结束后补齐。带 run fencing 时，旧 Worker 连打标记都改不到
+    新持有者的事件。
     """
+    fence = ""
+    params = {"hours": int(hours), "message_id": str(message_id)}
+    if run_id is not None and worker_id is not None and attempt is not None:
+        fence = (
+            " and exists (select 1 from chat_runs"
+            " where id = :run_id and worker_id = :worker_id and attempt = :attempt)"
+        )
+        params.update(
+            {
+                "run_id": str(run_id),
+                "worker_id": worker_id,
+                "attempt": int(attempt),
+            }
+        )
     with tenant_scope(tenant_id, user_id) as db:
         result = db.execute(
             text(
                 "update session_events"
                 "   set expires_at = now() + (:hours * interval '1 hour')"
-                " where message_id = :message_id and expires_at is null"
+                " where message_id = :message_id and expires_at is null" + fence
             ),
-            {"hours": int(hours), "message_id": str(message_id)},
+            params,
         )
         return int(result.rowcount or 0)
 
@@ -373,13 +431,50 @@ def append_event_in_session(
     ticket: QueueTicket,
     event: str,
     data: dict[str, Any],
+    *,
+    fenced: bool = True,
 ) -> None:
     """在调用方事务内写事件。
 
     ``run_id`` 必须落库：同一 message 重试时会有多次尝试，只按 message_id
     读会把两次尝试的事件混在一起，``after_seq`` 游标随之失效。
+
+    ``fenced=True`` 时插入和所有权校验在同一条语句里完成：租约被别的
+    Worker 接管后，旧 Worker 写不进任何一行，并抛 ``RunFenced``。
+    租约回收（``sweep``）写收尾事件时传 ``fenced=False``——它在同一个事务
+    里刚把 ``worker_id`` 清空，所有权由那条 update 的 rowcount 保证。
     """
     payload = json.dumps(data, ensure_ascii=False, default=str)
+    params = {
+        "tenant_id": str(ticket.tenant_id),
+        "user_id": str(ticket.user_id),
+        "conversation_id": str(ticket.conversation_id),
+        "message_id": str(ticket.message_id),
+        "run_id": str(ticket.run_id),
+        "event": event,
+        "data": payload,
+    }
+    if fenced and ticket.worker_id is not None:
+        result = db.execute(
+            text(
+                "insert into session_events "
+                "(tenant_id, user_id, conversation_id, message_id, run_id, event, data) "
+                "select :tenant_id, :user_id, :conversation_id, :message_id, :run_id,"
+                " :event, cast(:data as jsonb)"
+                " where exists ("
+                "   select 1 from chat_runs"
+                "    where id = :run_id"
+                "      and worker_id = :worker_id"
+                "      and attempt = :attempt"
+                " )"
+            ),
+            {**params, "worker_id": ticket.worker_id, "attempt": int(ticket.attempt)},
+        )
+        if int(result.rowcount or 0) != 1:
+            raise RunFenced(
+                f"run {ticket.run_id} is no longer owned by {ticket.worker_id}"
+            )
+        return
     db.execute(
         text(
             "insert into session_events "
@@ -387,15 +482,7 @@ def append_event_in_session(
             "values (:tenant_id, :user_id, :conversation_id, :message_id, :run_id,"
             " :event, cast(:data as jsonb))"
         ),
-        {
-            "tenant_id": str(ticket.tenant_id),
-            "user_id": str(ticket.user_id),
-            "conversation_id": str(ticket.conversation_id),
-            "message_id": str(ticket.message_id),
-            "run_id": str(ticket.run_id),
-            "event": event,
-            "data": payload,
-        },
+        params,
     )
 
 def append_event(ticket: QueueTicket, event: str, data: dict[str, Any]) -> None:
