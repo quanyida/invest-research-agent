@@ -397,10 +397,6 @@ def append_event_in_session(
             "data": payload,
         },
     )
-    db.execute(
-        text("update chat_runs set last_seq = last_seq + 1 where id = :id"),
-        {"id": str(ticket.run_id)},
-    )
 
 def append_event(ticket: QueueTicket, event: str, data: dict[str, Any]) -> None:
     with tenant_scope(ticket.tenant_id, ticket.user_id) as db:
