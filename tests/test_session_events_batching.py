@@ -398,3 +398,86 @@ def test_read_events_uses_after_cursor_and_id_order():
 
     assert "id > :after" in captured["sql"]
     assert "order by id" in captured["sql"]
+
+def test_purge_skips_when_advisory_lock_not_acquired(monkeypatch):
+    from contextlib import contextmanager
+
+    from app.agent import run_queue
+
+    statements: list[tuple[str, dict]] = []
+
+    class _Res:
+        def __init__(self, rowcount=0, scalar=None):
+            self.rowcount = rowcount
+            self._scalar = scalar
+
+        def scalar(self):
+            return self._scalar
+
+    class _DB:
+        def execute(self, stmt, params=None):
+            statements.append((str(stmt), params or {}))
+            return _Res(scalar=False)
+
+        def commit(self):
+            raise AssertionError("抢不到锁不应提交任何删除")
+
+    @contextmanager
+    def fake_scope():
+        yield _DB()
+
+    monkeypatch.setattr(run_queue, "session_scope", fake_scope)
+    monkeypatch.setattr(run_queue, "_known_tenants", lambda db: [("t", "u")])
+
+    assert run_queue.purge_expired_events() == 0
+    assert any("pg_try_advisory_lock" in sql for sql, _ in statements)
+    assert not any(sql.startswith("delete from session_events") for sql, _ in statements)
+
+
+def test_purge_deletes_in_batches_with_limit(monkeypatch):
+    from contextlib import contextmanager
+
+    from app.agent import run_queue
+
+    deletes: list[dict] = []
+    commits = {"n": 0}
+
+    class _Res:
+        def __init__(self, rowcount=0, scalar=None):
+            self.rowcount = rowcount
+            self._scalar = scalar
+
+        def scalar(self):
+            return self._scalar
+
+    class _DB:
+        def execute(self, stmt, params=None):
+            sql = str(stmt)
+            if sql.startswith("select pg_try_advisory_lock"):
+                return _Res(scalar=True)
+            if sql.startswith("select pg_advisory_unlock"):
+                return _Res(scalar=True)
+            if sql.startswith("delete from session_events"):
+                deletes.append(params)
+                # 第一批满批，第二批不足一批 -> 收敛
+                rowcount = params["batch"] if len(deletes) == 1 else 3
+                return _Res(rowcount=rowcount)
+            return _Res()
+
+        def commit(self):
+            commits["n"] += 1
+
+    @contextmanager
+    def fake_scope():
+        yield _DB()
+
+    monkeypatch.setattr(run_queue, "session_scope", fake_scope)
+    monkeypatch.setattr(run_queue, "_known_tenants", lambda db: [("t", "u")])
+
+    total = run_queue.purge_expired_events(batch_size=500)
+
+    assert total == 503
+    assert len(deletes) == 2
+    assert deletes[0]["batch"] == 500
+    assert commits["n"] >= 2, "每批都要单独提交，避免长事务"
+

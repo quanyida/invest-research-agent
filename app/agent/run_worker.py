@@ -43,6 +43,17 @@ _DELTA_FLUSH_CHARS = 200
 # 观战的 SSE 看不到进度，进程被杀时丢的内容也更多。
 _DELTA_FLUSH_INTERVAL_SECONDS = 1.0
 
+_DEFAULT_EVENT_RETENTION_HOURS = 24
+
+def _retention_hours(settings: Settings, run_type: str) -> int:
+    """按任务类型取事件保留时长；假 settings 缺字段时回退默认值。"""
+    attr = (
+        "event_retention_chat_hours"
+        if run_type == "chat"
+        else "event_retention_research_hours"
+    )
+    return int(getattr(settings, attr, _DEFAULT_EVENT_RETENTION_HOURS))
+
 def _next_event(iterator: Any) -> Any:
     try:
         return next(iterator)
@@ -172,11 +183,23 @@ class RunWorker:
         is_maintenance = run_type == "chat" and asyncio.current_task() is self._tasks[0]
         last_orphan_sweep = 0.0
         last_event_purge = 0.0
+        purge_interval = float(
+            getattr(
+                self.settings,
+                "event_purge_interval_seconds",
+                EVENT_PURGE_INTERVAL_SECONDS,
+            )
+        )
         while not self._stopping.is_set():
             try:
                 if is_maintenance:
                     recovered = await asyncio.to_thread(
-                        sweep, self.settings.run_max_attempts
+                        sweep,
+                        self.settings.run_max_attempts,
+                        chat_retention_hours=_retention_hours(self.settings, "chat"),
+                        research_retention_hours=_retention_hours(
+                            self.settings, "research"
+                        ),
                     )
                     for ticket, state in recovered:
                         logger.warning(
@@ -198,7 +221,7 @@ class RunWorker:
                             logger.warning(
                                 "marked %s orphan chat message(s) as failed", orphans
                             )
-                    if now - last_event_purge >= EVENT_PURGE_INTERVAL_SECONDS:
+                    if now - last_event_purge >= purge_interval:
                         last_event_purge = now
                         purged = await asyncio.to_thread(purge_expired_events)
                         if purged:
@@ -280,6 +303,7 @@ class RunWorker:
 
         done = False
         run_finalized = False
+        retention_hours = _retention_hours(self.settings, ticket.run_type)
         pending: list[str] = []
         pending_chars = 0
         last_flush_at = time.monotonic()
@@ -420,6 +444,7 @@ class RunWorker:
                     run_id=ticket.run_id,
                     worker_id=ticket.worker_id,
                     attempt=ticket.attempt,
+                    hours=retention_hours,
                 )
                 await asyncio.to_thread(
                     finish, ticket.run_id, "failed",
@@ -441,6 +466,7 @@ class RunWorker:
             run_id=ticket.run_id,
             worker_id=ticket.worker_id,
             attempt=ticket.attempt,
+            hours=retention_hours,
         )
         if run_finalized:
             return
@@ -475,6 +501,7 @@ class RunWorker:
                     run_id=ticket.run_id,
                     worker_id=ticket.worker_id,
                     attempt=ticket.attempt,
+                    hours=retention_hours,
                 )
                 await asyncio.to_thread(
                     finish,

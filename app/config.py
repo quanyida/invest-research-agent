@@ -117,6 +117,9 @@ class Settings:
     chat_timeout_seconds: float
     orphan_threshold_seconds: float
     orphan_sweep_seconds: float
+    event_retention_chat_hours: int
+    event_retention_research_hours: int
+    event_purge_interval_seconds: float
     web_search_enabled: bool
     web_search_provider: str
     web_search_base_url: str
@@ -197,6 +200,9 @@ def get_settings() -> Settings:
         chat_timeout_seconds=_float("CHAT_TIMEOUT_SECONDS", 60.0),
         orphan_threshold_seconds=_float("ORPHAN_THRESHOLD_SECONDS", 90.0),
         orphan_sweep_seconds=_float("ORPHAN_SWEEP_SECONDS", 3600.0),
+        event_retention_chat_hours=max(1, _int("EVENT_RETENTION_CHAT_HOURS", 24)),
+        event_retention_research_hours=max(1, _int("EVENT_RETENTION_RESEARCH_HOURS", 24)),
+        event_purge_interval_seconds=max(1.0, _float("EVENT_PURGE_INTERVAL_SECONDS", 600.0)),
         web_search_enabled=_bool("WEB_SEARCH_ENABLED", True),
         web_search_provider=os.getenv("WEB_SEARCH_PROVIDER", "tavily").strip().lower(),
         web_search_base_url=os.getenv(

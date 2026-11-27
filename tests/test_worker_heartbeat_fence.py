@@ -352,6 +352,112 @@ def test_sweep_writes_events_without_fence(monkeypatch):
     assert len(inserts) == 2
     assert all("worker_id = :worker_id" not in s for s in inserts)
 
+def test_sweep_failed_run_marks_events_expiring(monkeypatch):
+    """回收判失败后要在同一事务补 expires_at，否则这些事件永远清理不掉。"""
+    row = {
+        "id": RUN,
+        "tenant_id": TENANT,
+        "user_id": USER,
+        "conversation_id": CONV,
+        "message_id": MESSAGE,
+        "request_id": REQUEST,
+        "attempt": 1,
+        "worker_id": "worker-a",
+        "run_type": "chat",
+    }
+    statements: list[tuple[str, dict]] = []
+
+    class _Rows:
+        def mappings(self):
+            return self
+
+        def all(self):
+            return [row]
+
+    class _DB:
+        def execute(self, stmt, params=None):
+            sql = str(stmt)
+            statements.append((sql, params or {}))
+            if sql.startswith("select id, tenant_id"):
+                return _Rows()
+            return _Result(1)
+
+        def scalar(self, stmt):
+            return SimpleNamespace(
+                id=MESSAGE, status="running", content="", meta={}, updated_at=None
+            )
+
+    @contextmanager
+    def fake_scope():
+        yield _DB()
+
+    monkeypatch.setattr(run_queue, "session_scope", fake_scope)
+
+    recovered = run_queue.sweep(2, chat_retention_hours=7)
+    assert [state for _ticket, state in recovered] == ["failed"]
+    expiring = [(sql, p) for sql, p in statements if sql.startswith("update session_events")]
+    assert expiring, "failed run must mark its events expiring"
+    sql, params = expiring[0]
+    assert "expires_at" in sql and "expires_at is null" in sql
+    assert ":hours" in sql
+    assert params["hours"] == 7, "必须使用传入的保留时长，而不是写死 24"
+
+
+def test_sweep_uses_research_retention_hours(monkeypatch):
+    """research 用另一档保留时长。"""
+    row = {
+        "id": RUN,
+        "tenant_id": TENANT,
+        "user_id": USER,
+        "conversation_id": CONV,
+        "message_id": MESSAGE,
+        "request_id": REQUEST,
+        "attempt": 2,
+        "worker_id": "worker-a",
+        "run_type": "research",
+    }
+    statements: list[tuple[str, dict]] = []
+
+    class _Rows:
+        def mappings(self):
+            return self
+
+        def all(self):
+            return [row]
+
+    class _DB:
+        def execute(self, stmt, params=None):
+            sql = str(stmt)
+            statements.append((sql, params or {}))
+            if sql.startswith("select id, tenant_id"):
+                return _Rows()
+            return _Result(1)
+
+        def scalar(self, stmt):
+            return SimpleNamespace(
+                id=MESSAGE, status="running", content="", meta={}, updated_at=None
+            )
+
+    @contextmanager
+    def fake_scope():
+        yield _DB()
+
+    monkeypatch.setattr(run_queue, "session_scope", fake_scope)
+
+    run_queue.sweep(2, research_retention_hours=5)
+    expiring = [(sql, p) for sql, p in statements if sql.startswith("update session_events")]
+    assert expiring[0][1]["hours"] == 5
+
+
+def test_retention_hours_by_run_type_and_fallback():
+    settings = SimpleNamespace(
+        event_retention_chat_hours=3, event_retention_research_hours=9
+    )
+    assert run_worker._retention_hours(settings, "chat") == 3
+    assert run_worker._retention_hours(settings, "research") == 9
+    # 假 settings 缺字段时回退默认值，测试替身不用跟着改
+    assert run_worker._retention_hours(SimpleNamespace(), "chat") == 24
+
 def test_finish_is_fenced(monkeypatch):
     captured = {}
 

@@ -216,7 +216,12 @@ def finish(
         )
         return int(result.rowcount or 0) == 1
 
-def sweep(max_attempts: int) -> list[tuple[QueueTicket, str]]:
+def sweep(
+    max_attempts: int,
+    *,
+    chat_retention_hours: int = 24,
+    research_retention_hours: int = 24,
+) -> list[tuple[QueueTicket, str]]:
     """回收租约过期的 running 任务：未超次数回队列，超次数判失败。
 
     任务状态与消息状态在同一个事务里提交；扫尾 Worker 在两步之间宕机时
@@ -240,6 +245,9 @@ def sweep(max_attempts: int) -> list[tuple[QueueTicket, str]]:
         for row in rows:
             ticket = _ticket(row)
             is_chat = ticket.run_type == "chat"
+            retention_hours = (
+                chat_retention_hours if is_chat else research_retention_hours
+            )
             # 普通聊天一次机会：3 秒的任务重跑收益低于复杂度，崩溃即判死。
             # 深度研究允许重跑一次（attempt < limit）。
             if is_chat:
@@ -311,6 +319,19 @@ def sweep(max_attempts: int) -> list[tuple[QueueTicket, str]]:
                         "conversation_id": str(ticket.conversation_id),
                     },
                     fenced=False,
+                )
+                # 回收判失败的这一轮不会再调用 mark_events_expiring；
+                # 在同一事务里补过期时间，否则这些事件永远清理不掉。
+                db.execute(
+                    text(
+                        "update session_events"
+                        "   set expires_at = now() + (:hours * interval '1 hour')"
+                        " where message_id = :message_id and expires_at is null"
+                    ),
+                    {
+                        "message_id": str(ticket.message_id),
+                        "hours": int(retention_hours),
+                    },
                 )
             else:
                 db.execute(
@@ -416,14 +437,55 @@ def mark_events_expiring(
         )
         return int(result.rowcount or 0)
 
-def purge_expired_events() -> int:
-    """删除已过期的回放事件（research 任务终态 24 小时后）。"""
+_PURGE_LOCK_KEY = 912701
+_PURGE_BATCH_SIZE = 1000
+
+def purge_expired_events(batch_size: int = _PURGE_BATCH_SIZE) -> int:
+    """分批删除已过期的回放事件。
+
+    * 按 ``id`` 分批 DELETE，每批一个事务，避免一次删太多形成长事务、
+      长时间持锁。
+    * ``pg_try_advisory_lock`` 保证同一时刻只有一个 Worker 在清理：抢不到
+      锁直接跳过本轮；锁挂在连接上，跨批次提交仍持有，结束时显式释放。
+    * 每批提交后事务级 ``set_config`` 会失效，所以每批前重新设置租户 scope，
+      否则 RLS 会挡住后续批次的删除。
+    """
+    batch = max(1, int(batch_size))
     purged = 0
     with session_scope() as db:
-        for tenant_id, user_id in _known_tenants(db):
-            _scope(db, tenant_id, user_id)
-            result = db.execute(text("delete from session_events where expires_at < now()"))
-            purged += int(result.rowcount or 0)
+        locked = bool(
+            db.execute(
+                text("select pg_try_advisory_lock(:key)"),
+                {"key": _PURGE_LOCK_KEY},
+            ).scalar()
+        )
+        if not locked:
+            return 0
+        try:
+            for tenant_id, user_id in _known_tenants(db):
+                while True:
+                    _scope(db, tenant_id, user_id)
+                    result = db.execute(
+                        text(
+                            "delete from session_events"
+                            " where id in ("
+                            "   select id from session_events"
+                            "    where expires_at < now()"
+                            "    limit :batch"
+                            " )"
+                        ),
+                        {"batch": batch},
+                    )
+                    deleted = int(result.rowcount or 0)
+                    purged += deleted
+                    db.commit()
+                    if deleted < batch:
+                        break
+        finally:
+            db.execute(
+                text("select pg_advisory_unlock(:key)"),
+                {"key": _PURGE_LOCK_KEY},
+            )
     return purged
 
 def append_events_in_session(
